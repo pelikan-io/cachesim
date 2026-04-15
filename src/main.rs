@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{simulate, simulate_oracle, SimConfig};
+use cachesim::SegcachePolicy;
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
 };
@@ -53,6 +54,10 @@ enum Command {
         /// Maximum object size to cache in bytes.
         #[arg(long, default_value_t = 1_048_576)]
         max_obj_size: u32,
+
+        /// S3-FIFO admission-pool ratio (0.0–1.0, only used with `s3-fifo`).
+        #[arg(long, default_value_t = 0.10)]
+        admission_ratio: f64,
     },
 
     /// Convert a trace file to Parquet.
@@ -91,6 +96,7 @@ enum EvictionArg {
     Fifo,
     Cte,
     Util,
+    S3Fifo,
     // -- oracle (offline-optimal) policies --
     Belady,
     BeladySize,
@@ -100,18 +106,20 @@ impl EvictionArg {
     fn is_oracle(&self) -> bool {
         matches!(self, Self::Belady | Self::BeladySize)
     }
-}
 
-impl From<EvictionArg> for segcache::Policy {
-    fn from(p: EvictionArg) -> Self {
-        match p {
-            EvictionArg::None => Self::None,
-            EvictionArg::Random => Self::Random,
-            EvictionArg::RandomFifo => Self::RandomFifo,
-            EvictionArg::Fifo => Self::Fifo,
-            EvictionArg::Cte => Self::Cte,
-            EvictionArg::Util => Self::Util,
-            EvictionArg::Belady | EvictionArg::BeladySize => {
+    /// Convert a non-oracle CLI policy into a [`SegcachePolicy`].
+    ///
+    /// `admission_ratio` is only used for [`EvictionArg::S3Fifo`].
+    fn into_segcache(self, admission_ratio: f64) -> SegcachePolicy {
+        match self {
+            Self::None => SegcachePolicy::None,
+            Self::Random => SegcachePolicy::Random,
+            Self::RandomFifo => SegcachePolicy::RandomFifo,
+            Self::Fifo => SegcachePolicy::Fifo,
+            Self::Cte => SegcachePolicy::Cte,
+            Self::Util => SegcachePolicy::Util,
+            Self::S3Fifo => SegcachePolicy::S3Fifo { admission_ratio },
+            Self::Belady | Self::BeladySize => {
                 unreachable!("oracle policies handled separately")
             }
         }
@@ -161,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eviction,
             default_ttl,
             max_obj_size,
+            admission_ratio,
         } => {
             let cache_size =
                 parse_size(&cache_size).map_err(|e| format!("bad --cache-size: {e}"))?;
@@ -182,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cache_size,
                     segment_size,
                     hash_power,
-                    eviction: eviction.into(),
+                    eviction: eviction.into_segcache(admission_ratio),
                     default_ttl,
                     max_obj_size,
                 };

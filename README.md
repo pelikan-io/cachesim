@@ -229,6 +229,7 @@ cachesim info -t trace.parquet
 | `fifo` | segcache | First-in first-out |
 | `cte` | segcache | Closest-to-expiration |
 | `util` | segcache | Least-utilized segment |
+| `s3-fifo` | segcache | S3-FIFO: small, main, and ghost FIFO queues |
 | `belady` | oracle | Optimal: evict farthest future access |
 | `belady-size` | oracle | Optimal (size-aware): evict max(distance × size) |
 

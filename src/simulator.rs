@@ -21,11 +21,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use segcache::{Policy, Segcache};
+use segcache::Segcache;
 
 use crate::oracle::{OracleCache, OraclePolicy};
 use crate::trace::{Op, TraceReader};
-use crate::Error;
+use crate::{Error, SegcachePolicy};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -41,7 +41,7 @@ pub struct SimConfig {
     /// Hash table power – the table will have 2^`hash_power` buckets.
     pub hash_power: u8,
     /// Eviction policy.
-    pub eviction: Policy,
+    pub eviction: SegcachePolicy,
     /// Default TTL applied when the trace entry has no TTL (seconds, 0 = no
     /// expiration).
     pub default_ttl: u32,
@@ -55,7 +55,7 @@ impl Default for SimConfig {
             cache_size: 64 * 1024 * 1024, // 64 MiB
             segment_size: 1024 * 1024,    // 1 MiB
             hash_power: 16,
-            eviction: Policy::Fifo,
+            eviction: SegcachePolicy::Fifo,
             default_ttl: 0,
             max_obj_size: 1024 * 1024, // 1 MiB
         }
@@ -121,7 +121,7 @@ pub fn simulate(trace_path: impl AsRef<Path>, config: &SimConfig) -> Result<SimR
         .heap_size(config.cache_size)
         .segment_size(config.segment_size)
         .hash_power(config.hash_power)
-        .eviction(config.eviction)
+        .eviction(config.eviction.into())
         .build()?;
 
     let default_ttl = if config.default_ttl == 0 {
