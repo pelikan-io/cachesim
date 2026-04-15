@@ -20,7 +20,7 @@ Each row in a trace file represents a single cache request:
 
 | Column             | Arrow Type | Nullable | Description                                       |
 |--------------------|------------|----------|---------------------------------------------------|
-| `timestamp`        | `UInt64`   | no       | Request time in **nanoseconds** since Unix epoch   |
+| `timestamp`        | `Timestamp(ns, UTC)` | no | Request time in **nanoseconds** since Unix epoch |
 | `obj_id`           | `UInt64`   | no       | Object identifier                                  |
 | `obj_size`         | `UInt32`   | no       | Object size in bytes                               |
 | `next_access_vtime`| `Int64`    | no       | Virtual time of the next access (`-1` = no reuse)  |

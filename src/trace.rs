@@ -5,7 +5,7 @@
 //!
 //! | Field              | Type   | Bytes | Description                        |
 //! |--------------------|--------|-------|------------------------------------|
-//! | timestamp          | u64    | 8     | Real time (nanoseconds since epoch)|
+//! | timestamp          | i64    | 8     | Timestamp(ns, UTC) since epoch     |
 //! | obj_id             | u64    | 8     | Object identifier                  |
 //! | obj_size           | u32    | 4     | Object size in bytes               |
 //! | next_access_vtime  | i64    | 8     | Virtual time of next access        |
@@ -23,8 +23,11 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, UInt32Array, UInt64Array, UInt8Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, ArrayRef, Int32Array, Int64Array, TimestampNanosecondArray, UInt32Array, UInt64Array,
+    UInt8Array,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -116,8 +119,9 @@ impl Op {
 /// A single trace request, field-compatible with libCacheSim's oracleGeneral.
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
-    /// Real time (nanoseconds since epoch).
-    pub timestamp: u64,
+    /// Real time as nanoseconds since Unix epoch (stored as Arrow
+    /// `Timestamp(Nanosecond, Some("UTC"))` in Parquet).
+    pub timestamp: i64,
     /// Object identifier.
     pub obj_id: u64,
     /// Object size in bytes.
@@ -138,7 +142,11 @@ pub struct TraceEntry {
 /// Canonical Arrow schema for cachesim trace files.
 pub fn trace_schema() -> Schema {
     Schema::new(vec![
-        Field::new("timestamp", DataType::UInt64, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+            false,
+        ),
         Field::new("obj_id", DataType::UInt64, false),
         Field::new("obj_size", DataType::UInt32, false),
         Field::new("next_access_vtime", DataType::Int64, false),
@@ -192,7 +200,7 @@ impl Iterator for TraceReader {
             let i = self.row_idx;
             self.row_idx += 1;
 
-            let timestamp = col_u64(batch, "timestamp").map(|a| a.value(i)).unwrap_or(0);
+            let timestamp = col_ts_ns(batch, "timestamp").map(|a| a.value(i)).unwrap_or(0);
             let obj_id = col_u64(batch, "obj_id").map(|a| a.value(i)).unwrap_or(0);
             let obj_size = col_u32(batch, "obj_size").map(|a| a.value(i)).unwrap_or(0);
             let next_access_vtime = col_i64(batch, "next_access_vtime")
@@ -227,6 +235,11 @@ impl Iterator for TraceReader {
 }
 
 // Column downcast helpers
+fn col_ts_ns<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a TimestampNanosecondArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref())
+}
 fn col_u8<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt8Array> {
     batch
         .column_by_name(name)
@@ -262,7 +275,7 @@ pub struct TraceWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
     // Column buffers
-    timestamps: Vec<u64>,
+    timestamps: Vec<i64>,
     obj_ids: Vec<u64>,
     obj_sizes: Vec<u32>,
     next_access_vtimes: Vec<i64>,
@@ -315,7 +328,10 @@ impl TraceWriter {
         }
 
         let arrays: Vec<ArrayRef> = vec![
-            Arc::new(UInt64Array::from(std::mem::take(&mut self.timestamps))),
+            Arc::new(
+                TimestampNanosecondArray::from(std::mem::take(&mut self.timestamps))
+                    .with_timezone("UTC"),
+            ),
             Arc::new(UInt64Array::from(std::mem::take(&mut self.obj_ids))),
             Arc::new(UInt32Array::from(std::mem::take(&mut self.obj_sizes))),
             Arc::new(Int64Array::from(std::mem::take(&mut self.next_access_vtimes))),
@@ -396,14 +412,14 @@ pub fn convert_bin_to_parquet(
     Ok(num_records)
 }
 
-const NANOS_PER_SEC: u64 = 1_000_000_000;
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Parse a 24-byte oracleGeneral record (little-endian, packed).
-/// The on-wire timestamp is u32 seconds; we widen to u64 nanoseconds.
+/// The on-wire timestamp is u32 seconds; we widen to i64 nanoseconds.
 fn parse_oracle_general(buf: &[u8]) -> TraceEntry {
     let secs = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     TraceEntry {
-        timestamp: secs as u64 * NANOS_PER_SEC,
+        timestamp: secs as i64 * NANOS_PER_SEC,
         obj_id: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
         obj_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
         next_access_vtime: i64::from_le_bytes(buf[16..24].try_into().unwrap()),
@@ -413,11 +429,11 @@ fn parse_oracle_general(buf: &[u8]) -> TraceEntry {
 }
 
 /// Parse a 27-byte oracleGeneralOpNs record (little-endian, packed).
-/// The on-wire timestamp is u32 seconds; we widen to u64 nanoseconds.
+/// The on-wire timestamp is u32 seconds; we widen to i64 nanoseconds.
 fn parse_oracle_general_opns(buf: &[u8]) -> TraceEntry {
     let secs = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     TraceEntry {
-        timestamp: secs as u64 * NANOS_PER_SEC,
+        timestamp: secs as i64 * NANOS_PER_SEC,
         obj_id: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
         obj_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
         op: Some(buf[16]),
@@ -489,7 +505,7 @@ fn parse_cache_trace_line(line: &str, hash_state: &ahash::RandomState) -> Result
     let op_str = fields.next().ok_or_else(|| bad_csv("missing operation"))?;
     let ttl_str = fields.next().ok_or_else(|| bad_csv("missing ttl"))?;
 
-    let timestamp_secs: u64 = ts_str
+    let timestamp_secs: i64 = ts_str
         .parse()
         .map_err(|e| bad_csv(&format!("bad timestamp '{ts_str}': {e}")))?;
     let key_size: u32 = ks_str
@@ -560,8 +576,8 @@ mod tests {
         buf[16..24].copy_from_slice(&next_vtime.to_le_bytes());
 
         let parsed = parse_oracle_general(&buf);
-        // Binary parser widens u32 seconds → u64 nanoseconds
-        assert_eq!(parsed.timestamp, ts_secs as u64 * NANOS_PER_SEC);
+        // Binary parser widens u32 seconds → i64 nanoseconds
+        assert_eq!(parsed.timestamp, ts_secs as i64 * NANOS_PER_SEC);
         assert_eq!(parsed.obj_id, obj_id);
         assert_eq!(parsed.obj_size, obj_size);
         assert_eq!(parsed.next_access_vtime, next_vtime);
@@ -626,7 +642,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        // Read
+        // Read back and verify values
         let reader = TraceReader::open(&path).unwrap();
         assert_eq!(reader.total_entries(), 3);
         let read_entries: Vec<TraceEntry> = reader.collect();
@@ -639,6 +655,45 @@ mod tests {
             assert_eq!(orig.op, read.op);
             assert_eq!(orig.ttl, read.ttl);
         }
+    }
+
+    #[test]
+    fn parquet_schema_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema_check.parquet");
+
+        let mut writer = TraceWriter::create(&path, 1024).unwrap();
+        writer
+            .write(&TraceEntry {
+                timestamp: 1_700_000_000_000_000_000,
+                obj_id: 1,
+                obj_size: 64,
+                next_access_vtime: -1,
+                op: None,
+                ttl: None,
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Re-open and inspect the Parquet schema directly
+        let file = File::open(&path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let arrow_schema = builder.schema();
+
+        // Column names
+        let names: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            &["timestamp", "obj_id", "obj_size", "next_access_vtime", "op", "ttl"]
+        );
+
+        // Timestamp column carries Nanosecond + UTC metadata
+        let ts_field = arrow_schema.field_with_name("timestamp").unwrap();
+        assert_eq!(
+            *ts_field.data_type(),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC")))
+        );
+        assert!(!ts_field.is_nullable());
     }
 
     #[test]

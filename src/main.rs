@@ -192,8 +192,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reader = TraceReader::open(&trace)?;
             let total = reader.total_entries();
 
-            let mut min_ts = u64::MAX;
-            let mut max_ts = 0u64;
+            let mut min_ts = i64::MAX;
+            let mut max_ts = 0i64;
             let mut min_size = u32::MAX;
             let mut max_size = 0u32;
             let mut total_size: u64 = 0;
