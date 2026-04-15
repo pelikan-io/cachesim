@@ -21,11 +21,12 @@
 use std::path::Path;
 use std::time::Duration;
 
+use cuckoo_cache::CuckooCache;
 use segcache::Segcache;
 
 use crate::oracle::{OracleCache, OraclePolicy};
 use crate::trace::{Op, TraceReader};
-use crate::{Error, SegcachePolicy};
+use crate::{CuckooPolicy, Error, SegcachePolicy};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -180,6 +181,116 @@ pub fn simulate(trace_path: impl AsRef<Path>, config: &SimConfig) -> Result<SimR
 
     Ok(result)
 }
+
+// ---------------------------------------------------------------------------
+// Cuckoo-cache simulation
+// ---------------------------------------------------------------------------
+
+/// Parameters for a cuckoo-cache simulation run.
+#[derive(Debug, Clone)]
+pub struct CuckooConfig {
+    /// Number of item slots in the cache.
+    pub nitem: usize,
+    /// Fixed byte size per item slot (must accommodate key + value + metadata).
+    pub item_size: usize,
+    /// Maximum displacement chain depth before eviction.
+    pub max_displace: usize,
+    /// Eviction policy.
+    pub eviction: CuckooPolicy,
+    /// Default TTL applied when the trace entry has no TTL (seconds, 0 = no
+    /// expiration).
+    pub default_ttl: u32,
+    /// Maximum TTL the cache will accept (seconds).
+    pub max_ttl: u32,
+    /// Objects larger than this are skipped (bytes).
+    pub max_obj_size: u32,
+}
+
+impl Default for CuckooConfig {
+    fn default() -> Self {
+        Self {
+            nitem: 65_536,
+            item_size: 64,
+            max_displace: 16,
+            eviction: CuckooPolicy::Random,
+            default_ttl: 0,
+            max_ttl: 2_592_000, // 30 days
+            max_obj_size: 1024 * 1024,
+        }
+    }
+}
+
+/// Run a cache simulation by replaying `trace_path` against cuckoo-cache.
+pub fn simulate_cuckoo(
+    trace_path: impl AsRef<Path>,
+    config: &CuckooConfig,
+) -> Result<SimResult, Error> {
+    let reader = TraceReader::open(trace_path)?;
+
+    let mut cache = CuckooCache::builder()
+        .nitem(config.nitem)
+        .item_size(config.item_size)
+        .max_displace(config.max_displace)
+        .policy(config.eviction.into())
+        .max_ttl(config.max_ttl)
+        .build();
+
+    let default_ttl = if config.default_ttl == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(config.default_ttl as u64)
+    };
+
+    let value_buf = vec![0u8; config.max_obj_size as usize];
+
+    let mut result = SimResult::default();
+
+    for entry in reader {
+        result.total_requests += 1;
+
+        if entry.obj_size > config.max_obj_size || entry.obj_size == 0 {
+            result.skipped += 1;
+            continue;
+        }
+
+        let key = entry.obj_id.to_le_bytes();
+        let op = entry.op.map(Op::from_u8).unwrap_or(Op::Get);
+
+        let ttl = entry
+            .ttl
+            .filter(|&t| t > 0)
+            .map(|t| Duration::from_secs(t as u64))
+            .unwrap_or(default_ttl);
+
+        let value = &value_buf[..entry.obj_size as usize];
+
+        if op.is_delete() {
+            cache.delete(&key);
+            result.deletes += 1;
+        } else if op.is_write() {
+            match cache.insert(&key, value, None, ttl) {
+                Ok(()) => result.inserts += 1,
+                Err(_) => result.insert_failures += 1,
+            }
+        } else {
+            if cache.get(&key).is_some() {
+                result.hits += 1;
+            } else {
+                result.misses += 1;
+                match cache.insert(&key, value, None, ttl) {
+                    Ok(()) => result.inserts += 1,
+                    Err(_) => result.insert_failures += 1,
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Oracle simulation
+// ---------------------------------------------------------------------------
 
 /// Run an oracle (offline-optimal) simulation.
 ///
@@ -365,6 +476,128 @@ mod tests {
         assert_eq!(result.hits, 1); // GET hits
         assert_eq!(result.misses, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Cuckoo-cache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cuckoo_all_hits_after_warmup() {
+        let entries: Vec<TraceEntry> = (0..2)
+            .map(|i| TraceEntry {
+                timestamp: i,
+                obj_id: 1,
+                obj_size: 8,
+                next_access_vtime: if i == 0 { 1 } else { -1 },
+                op: None,
+                ttl: None,
+            })
+            .collect();
+
+        let (_dir, path) = write_synthetic_trace(&entries);
+
+        let config = CuckooConfig {
+            nitem: 1024,
+            item_size: 64,
+            ..Default::default()
+        };
+
+        let result = simulate_cuckoo(&path, &config).unwrap();
+        assert_eq!(result.total_requests, 2);
+        assert_eq!(result.misses, 1);
+        assert_eq!(result.hits, 1);
+        assert!((result.hit_rate() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cuckoo_oversized_objects_are_skipped() {
+        let entries = vec![TraceEntry {
+            timestamp: 0,
+            obj_id: 1,
+            obj_size: 2_000_000,
+            next_access_vtime: -1,
+            op: None,
+            ttl: None,
+        }];
+
+        let (_dir, path) = write_synthetic_trace(&entries);
+        let config = CuckooConfig::default();
+        let result = simulate_cuckoo(&path, &config).unwrap();
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.misses, 0);
+    }
+
+    #[test]
+    fn cuckoo_delete_operations() {
+        let entries = vec![
+            TraceEntry {
+                timestamp: 0,
+                obj_id: 1,
+                obj_size: 8,
+                next_access_vtime: 1,
+                op: Some(Op::Get as u8),
+                ttl: None,
+            },
+            TraceEntry {
+                timestamp: 1,
+                obj_id: 1,
+                obj_size: 8,
+                next_access_vtime: -1,
+                op: Some(Op::Delete as u8),
+                ttl: None,
+            },
+        ];
+
+        let (_dir, path) = write_synthetic_trace(&entries);
+        let config = CuckooConfig {
+            nitem: 1024,
+            item_size: 64,
+            ..Default::default()
+        };
+
+        let result = simulate_cuckoo(&path, &config).unwrap();
+        assert_eq!(result.misses, 1);
+        assert_eq!(result.deletes, 1);
+        assert_eq!(result.hits, 0);
+    }
+
+    #[test]
+    fn cuckoo_write_operations_dont_count_as_hits() {
+        let entries = vec![
+            TraceEntry {
+                timestamp: 0,
+                obj_id: 1,
+                obj_size: 8,
+                next_access_vtime: 1,
+                op: Some(Op::Set as u8),
+                ttl: None,
+            },
+            TraceEntry {
+                timestamp: 1,
+                obj_id: 1,
+                obj_size: 8,
+                next_access_vtime: -1,
+                op: Some(Op::Get as u8),
+                ttl: None,
+            },
+        ];
+
+        let (_dir, path) = write_synthetic_trace(&entries);
+        let config = CuckooConfig {
+            nitem: 1024,
+            item_size: 64,
+            ..Default::default()
+        };
+
+        let result = simulate_cuckoo(&path, &config).unwrap();
+        assert_eq!(result.inserts, 1);
+        assert_eq!(result.hits, 1);
+        assert_eq!(result.misses, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Oracle tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn belady_optimal_eviction() {

@@ -316,6 +316,7 @@ dependencies = [
  "ahash",
  "arrow",
  "clap",
+ "cuckoo-cache",
  "parquet",
  "segcache",
  "tempfile",
@@ -470,6 +471,19 @@ name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
+name = "cuckoo-cache"
+version = "0.1.0"
+source = "git+https://github.com/pelikan-io/cache-rs#520fa359905e9cb8765925891d9e76fb20877c05"
+dependencies = [
+ "ahash",
+ "clocksource",
+ "keyvalue 0.1.0 (git+https://github.com/pelikan-io/cache-rs)",
+ "log",
+ "rand",
+ "thiserror",
+]
 
 [[package]]
 name = "deranged"
@@ -679,6 +693,11 @@ name = "keyvalue"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "952575e954c40949f91098c987e68740c5d34cb320b06f4e898be4eea9aeabe1"
+
+[[package]]
+name = "keyvalue"
+version = "0.1.0"
+source = "git+https://github.com/pelikan-io/cache-rs#520fa359905e9cb8765925891d9e76fb20877c05"
 
 [[package]]
 name = "leb128fmt"
@@ -1057,7 +1076,7 @@ checksum = "709675370d962ce1e247abae564282084dc692e483c27f1e861b795c0947354f"
 dependencies = [
  "ahash",
  "clocksource",
- "keyvalue",
+ "keyvalue 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "log",
  "rand",
  "rand_xoshiro",
