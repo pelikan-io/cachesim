@@ -115,7 +115,7 @@ impl std::fmt::Display for SimResult {
 // ---------------------------------------------------------------------------
 
 /// Run a cache simulation by replaying `trace_path` against segcache.
-pub fn simulate(trace_path: impl AsRef<Path>, config: &SimConfig) -> Result<SimResult, Error> {
+pub fn simulate_segcache(trace_path: impl AsRef<Path>, config: &SimConfig) -> Result<SimResult, Error> {
     let reader = TraceReader::open(trace_path)?;
 
     let mut cache = Segcache::builder()
@@ -294,7 +294,7 @@ pub fn simulate_cuckoo(
 
 /// Run an oracle (offline-optimal) simulation.
 ///
-/// Unlike [`simulate`], this does not use segcache — it uses an
+/// Unlike [`simulate_segcache`], this does not use segcache — it uses an
 /// [`OracleCache`] backed by the `next_access_vtime` field in the trace.
 /// Segcache-specific knobs (segment size, hash power, TTL) do not apply.
 pub fn simulate_oracle(
@@ -382,7 +382,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = simulate(&path, &config).unwrap();
+        let result = simulate_segcache(&path, &config).unwrap();
         assert_eq!(result.total_requests, 2);
         assert_eq!(result.misses, 1);
         assert_eq!(result.hits, 1);
@@ -402,7 +402,7 @@ mod tests {
 
         let (_dir, path) = write_synthetic_trace(&entries);
         let config = SimConfig::default();
-        let result = simulate(&path, &config).unwrap();
+        let result = simulate_segcache(&path, &config).unwrap();
         assert_eq!(result.skipped, 1);
         assert_eq!(result.misses, 0);
     }
@@ -436,7 +436,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = simulate(&path, &config).unwrap();
+        let result = simulate_segcache(&path, &config).unwrap();
         assert_eq!(result.misses, 1);
         assert_eq!(result.deletes, 1);
         assert_eq!(result.hits, 0);
@@ -471,7 +471,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = simulate(&path, &config).unwrap();
+        let result = simulate_segcache(&path, &config).unwrap();
         assert_eq!(result.inserts, 1); // SET inserts
         assert_eq!(result.hits, 1); // GET hits
         assert_eq!(result.misses, 0);

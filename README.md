@@ -172,7 +172,7 @@ theoretical upper bounds when evaluating online policies.
   max displacement depth, eviction policy, TTL settings, max object size.
 - **`SimResult`** — aggregate counters (hits, misses, inserts, insert failures,
   deletes, skipped) with `hit_rate()` / `miss_rate()`.
-- **`simulate()`** — reads a Parquet trace, builds a `segcache::Segcache`
+- **`simulate_segcache()`** — reads a Parquet trace, builds a `segcache::Segcache`
   instance, and replays every request:
   - *Read* ops → lookup; on miss, insert (demand-fetch).
   - *Write* ops → unconditional insert/overwrite.

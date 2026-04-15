@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use cachesim::oracle::OraclePolicy;
-use cachesim::simulator::{simulate, simulate_cuckoo, simulate_oracle, CuckooConfig, SimConfig};
+use cachesim::simulator::{simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig};
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
 };
@@ -252,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("  hash power:    {}", config.hash_power);
                     eprintln!("  eviction:      {:?}", config.eviction);
 
-                    simulate(&sim.trace, &config)?
+                    simulate_segcache(&sim.trace, &config)?
                 }
 
                 Engine::Cuckoo {

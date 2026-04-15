@@ -25,7 +25,7 @@ CI runs on ubuntu, macos, and windows. All four checks (lint, 3x build-and-test)
 src/lib.rs          Policy enums (SegcachePolicy, CuckooPolicy), Error type
 src/trace.rs        TraceEntry, TraceReader/Writer, Parquet I/O, format converters
 src/oracle.rs       OracleCache with Belady/BeladySize policies
-src/simulator.rs    SimConfig/CuckooConfig, simulate()/simulate_cuckoo()/simulate_oracle(), SimResult
+src/simulator.rs    SimConfig/CuckooConfig, simulate_segcache()/simulate_cuckoo()/simulate_oracle(), SimResult
 src/main.rs         CLI (clap): simulate, convert, info subcommands
 ```
 
@@ -37,7 +37,7 @@ Each engine has its own config struct, simulation function, and policy enum:
 
 | Engine | Config | Function | Policy enum | Backing crate |
 |--------|--------|----------|-------------|---------------|
-| segcache | `SimConfig` | `simulate()` | `SegcachePolicy` | `segcache` (crates.io) |
+| segcache | `SimConfig` | `simulate_segcache()` | `SegcachePolicy` | `segcache` (crates.io) |
 | cuckoo | `CuckooConfig` | `simulate_cuckoo()` | `CuckooPolicy` | `cuckoo-cache` (git dep) |
 | oracle | params only | `simulate_oracle()` | `OraclePolicy` | in-tree `oracle.rs` |
 
@@ -69,3 +69,4 @@ Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `
 - Policy enums in `lib.rs` mirror upstream crate policies with `From` conversions
 - Errors use `thiserror` with `#[from]` for automatic conversion
 - Tests use synthetic Parquet traces via `write_synthetic_trace()` helper in `simulator::tests`
+- Do not include `claude.ai` session links in commits or PRs
