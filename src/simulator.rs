@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use segcache::{Policy, Segcache};
 
+use crate::oracle::{OracleCache, OraclePolicy};
 use crate::trace::{Op, TraceReader};
 use crate::Error;
 
@@ -180,6 +181,51 @@ pub fn simulate(trace_path: impl AsRef<Path>, config: &SimConfig) -> Result<SimR
     Ok(result)
 }
 
+/// Run an oracle (offline-optimal) simulation.
+///
+/// Unlike [`simulate`], this does not use segcache — it uses an
+/// [`OracleCache`] backed by the `next_access_vtime` field in the trace.
+/// Segcache-specific knobs (segment size, hash power, TTL) do not apply.
+pub fn simulate_oracle(
+    trace_path: impl AsRef<Path>,
+    capacity: usize,
+    policy: OraclePolicy,
+) -> Result<SimResult, Error> {
+    let reader = TraceReader::open(trace_path)?;
+    let mut cache = OracleCache::new(capacity, policy);
+    let mut result = SimResult::default();
+
+    for entry in reader {
+        result.total_requests += 1;
+
+        if entry.obj_size == 0 {
+            result.skipped += 1;
+            continue;
+        }
+
+        let op = entry.op.map(Op::from_u8).unwrap_or(Op::Get);
+
+        if op.is_delete() {
+            cache.remove(entry.obj_id);
+            result.deletes += 1;
+        } else if op.is_write() {
+            cache.insert(entry.obj_id, entry.obj_size, entry.next_access_vtime);
+            result.inserts += 1;
+        } else {
+            // Read: lookup (updating oracle data on hit), demand-fetch on miss.
+            if cache.lookup(entry.obj_id, entry.next_access_vtime) {
+                result.hits += 1;
+            } else {
+                result.misses += 1;
+                cache.insert(entry.obj_id, entry.obj_size, entry.next_access_vtime);
+                result.inserts += 1;
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -318,5 +364,57 @@ mod tests {
         assert_eq!(result.inserts, 1); // SET inserts
         assert_eq!(result.hits, 1); // GET hits
         assert_eq!(result.misses, 0);
+    }
+
+    #[test]
+    fn belady_optimal_eviction() {
+        // Three objects, cache fits two.  Access pattern:
+        //   vtime 0: obj A (next=2)  → miss, insert
+        //   vtime 1: obj B (next=3)  → miss, insert (cache full)
+        //   vtime 2: obj C (next=-1) → miss, Belady evicts B (nav=3 > nav_A=2)
+        //            but wait — A was accessed at vtime 0 with nav=2,
+        //            meaning A's next access is at vtime 2, which is NOW.
+        //   Let's redo: A(nav=4), B(nav=3). Insert C → evict A (nav=4 > 3).
+        //   vtime 3: obj B → hit
+        let entries = vec![
+            TraceEntry {
+                timestamp: 0,
+                obj_id: 1,
+                obj_size: 50,
+                next_access_vtime: 4, // far
+                op: None,
+                ttl: None,
+            },
+            TraceEntry {
+                timestamp: 0,
+                obj_id: 2,
+                obj_size: 50,
+                next_access_vtime: 3, // sooner
+                op: None,
+                ttl: None,
+            },
+            TraceEntry {
+                timestamp: 0,
+                obj_id: 3,
+                obj_size: 50,
+                next_access_vtime: -1,
+                op: None,
+                ttl: None,
+            },
+            TraceEntry {
+                timestamp: 0,
+                obj_id: 2,
+                obj_size: 50,
+                next_access_vtime: -1,
+                op: None,
+                ttl: None,
+            },
+        ];
+
+        let (_dir, path) = write_synthetic_trace(&entries);
+        let result = simulate_oracle(&path, 100, OraclePolicy::Belady).unwrap();
+        // Requests: miss(A), miss(B), miss(C)→evict A(nav=4), hit(B)
+        assert_eq!(result.misses, 3);
+        assert_eq!(result.hits, 1);
     }
 }

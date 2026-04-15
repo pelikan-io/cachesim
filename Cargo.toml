@@ -1,6 +1,6 @@
 [package]
 name = "cachesim-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Cache trace simulator for cache-rs crates, with libCacheSim-compatible trace formats"
@@ -19,7 +19,7 @@ ahash = "0.8"
 arrow = { version = "54", default-features = false, features = ["prettyprint"] }
 clap = { version = "4", features = ["derive"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
-segcache = { version = "0.1.1", default-features = false }
+segcache = { version = "0.2.0", default-features = false }
 thiserror = "2"
 zstd = "0.13"
 

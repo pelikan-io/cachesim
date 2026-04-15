@@ -8,9 +8,13 @@ crates, with a trace format inspired by
 
 cachesim replays recorded cache workload traces against cache implementations
 from the cache-rs project (currently [segcache](https://github.com/pelikan-io/cache-rs/tree/main/crates/segcache))
-and reports hit/miss statistics. Traces are stored on disk as
-[Parquet](https://parquet.apache.org/) files, and cachesim can import
-libCacheSim's binary trace formats directly.
+and reports hit/miss statistics. It also includes oracle (offline-optimal)
+eviction policies — Belady and BeladySize — as theoretical baselines.
+
+Traces are stored on disk as [Parquet](https://parquet.apache.org/) files, and
+cachesim can import libCacheSim's binary trace formats and
+[pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV files
+directly.
 
 ## Data Format
 
@@ -121,6 +125,7 @@ Field mapping during import:
 src/
 ├── lib.rs          # Crate root, module declarations, Error type
 ├── trace.rs        # Trace data model, Parquet I/O, format conversion
+├── oracle.rs       # Belady and BeladySize oracle caches
 ├── simulator.rs    # Cache simulation engine
 └── main.rs         # CLI (clap)
 ```
@@ -138,10 +143,27 @@ src/
 - **`Op`** — operation enum matching `req_op_e`, with `is_read()` /
   `is_write()` / `is_delete()` classification helpers.
 
+### `oracle` module
+
+Offline-optimal eviction policies that use the `next_access_vtime` column
+(future knowledge) to make perfect eviction decisions. These serve as
+theoretical upper bounds when evaluating online policies.
+
+- **`OraclePolicy::Belady`** — evict the object whose next access is farthest
+  in the future. Optimal for minimizing miss count with uniform-size objects
+  (Bélády, 1966).
+- **`OraclePolicy::BeladySize`** — evict the object that maximizes
+  `next_access_vtime × obj_size`. This frees the most *cache-byte-time* and
+  is a better reference for variable-size workloads, biasing toward evicting
+  large objects that will not be needed soon.
+- **`OracleCache`** — byte-capacity cache backed by a `BTreeSet` priority
+  queue. Supports `lookup` (hit + update oracle data), `insert` (with
+  eviction), and `remove`.
+
 ### `simulator` module
 
-- **`SimConfig`** — all knobs for a run: cache size, segment size, hash power,
-  eviction policy, default TTL, max object size.
+- **`SimConfig`** — all knobs for a segcache run: cache size, segment size,
+  hash power, eviction policy, default TTL, max object size.
 - **`SimResult`** — aggregate counters (hits, misses, inserts, insert failures,
   deletes, skipped) with `hit_rate()` / `miss_rate()`.
 - **`simulate()`** — reads a Parquet trace, builds a `segcache::Segcache`
@@ -150,6 +172,8 @@ src/
   - *Write* ops → unconditional insert/overwrite.
   - *Delete* ops → remove.
   - Objects exceeding `max_obj_size` are skipped.
+- **`simulate_oracle()`** — same replay loop but against an `OracleCache`.
+  Only needs cache size and oracle policy (segcache knobs do not apply).
 
 ### CLI (`main.rs`)
 
@@ -157,7 +181,7 @@ Three subcommands:
 
 | Command     | Description                                      |
 |-------------|--------------------------------------------------|
-| `simulate`  | Replay a Parquet trace against segcache           |
+| `simulate`  | Replay a Parquet trace against segcache or oracle |
 | `convert`   | Import a trace to Parquet (binary or CSV)          |
 | `info`      | Print summary statistics for a Parquet trace file |
 
@@ -170,8 +194,14 @@ cachesim convert -i trace.oracleGeneral.bin -o trace.parquet
 # Convert a pelikan-io/cache-trace CSV (zstd-compressed)
 cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
 
-# Run a simulation (64 MB cache, FIFO eviction)
+# Run a simulation (64 MB cache, FIFO eviction via segcache)
 cachesim simulate -t trace.parquet -c 64M -e fifo
+
+# Run a Belady (optimal) simulation as a reference baseline
+cachesim simulate -t trace.parquet -c 64M -e belady
+
+# Run a size-aware optimal simulation
+cachesim simulate -t trace.parquet -c 64M -e belady-size
 
 # Inspect a trace
 cachesim info -t trace.parquet
@@ -184,10 +214,26 @@ cachesim info -t trace.parquet
 -c, --cache-size <SIZE>    Cache size with K/M/G suffix [default: 64M]
 -s, --segment-size <N>     Segment size in bytes [default: 1048576]
     --hash-power <N>       Hash table buckets = 2^N [default: 16]
--e, --eviction <POLICY>    none|random|random-fifo|fifo|cte|util [default: fifo]
+-e, --eviction <POLICY>    Eviction policy [default: fifo]
     --default-ttl <SECS>   Default TTL, 0 = none [default: 0]
     --max-obj-size <N>     Skip objects larger than N bytes [default: 1048576]
 ```
+
+#### Eviction policies
+
+| Policy | Engine | Description |
+|--------|--------|-------------|
+| `none` | segcache | No eviction; inserts fail when full |
+| `random` | segcache | Random segment eviction |
+| `random-fifo` | segcache | Random TTL bucket, FIFO within |
+| `fifo` | segcache | First-in first-out |
+| `cte` | segcache | Closest-to-expiration |
+| `util` | segcache | Least-utilized segment |
+| `belady` | oracle | Optimal: evict farthest future access |
+| `belady-size` | oracle | Optimal (size-aware): evict max(distance × size) |
+
+Oracle policies use `next_access_vtime` from the trace and ignore
+segcache-specific options (segment size, hash power, TTL).
 
 ## Building
 

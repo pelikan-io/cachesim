@@ -1,3 +1,4 @@
+pub mod oracle;
 pub mod simulator;
 pub mod trace;
 
