@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{simulate, simulate_oracle, SimConfig};
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
 };
+use cachesim::SegcachePolicy;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -25,35 +26,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a cache simulation against a Parquet trace file.
-    Simulate {
-        /// Path to the trace file (Parquet format).
-        #[arg(short, long)]
-        trace: PathBuf,
-
-        /// Cache size (supports K/M/G suffixes, e.g. "64M").
-        #[arg(short, long, default_value = "64M")]
-        cache_size: String,
-
-        /// Segment size in bytes.
-        #[arg(short, long, default_value_t = 1_048_576)]
-        segment_size: i32,
-
-        /// Hash table power (table has 2^N buckets).
-        #[arg(long, default_value_t = 16)]
-        hash_power: u8,
-
-        /// Eviction policy.
-        #[arg(short, long, default_value = "fifo")]
-        eviction: EvictionArg,
-
-        /// Default TTL in seconds (0 = no expiration).
-        #[arg(long, default_value_t = 0)]
-        default_ttl: u32,
-
-        /// Maximum object size to cache in bytes.
-        #[arg(long, default_value_t = 1_048_576)]
-        max_obj_size: u32,
-    },
+    Simulate(SimulateCmd),
 
     /// Convert a trace file to Parquet.
     Convert {
@@ -78,42 +51,98 @@ enum Command {
     },
 }
 
+#[derive(Args)]
+struct SimulateCmd {
+    /// Path to the trace file (Parquet format).
+    #[arg(short, long)]
+    trace: PathBuf,
+
+    /// Cache size (supports K/M/G suffixes, e.g. "64M").
+    #[arg(short, long, default_value = "64M")]
+    cache_size: String,
+
+    /// Cache engine and its policy.
+    #[command(subcommand)]
+    engine: Engine,
+}
+
+#[derive(Subcommand)]
+enum Engine {
+    /// Simulate using the segcache engine.
+    Segcache {
+        /// Eviction policy.
+        #[arg(short, long, default_value = "fifo")]
+        policy: SegcachePolicyArg,
+
+        /// Segment size in bytes.
+        #[arg(short, long, default_value_t = 1_048_576)]
+        segment_size: i32,
+
+        /// Hash table power (table has 2^N buckets).
+        #[arg(long, default_value_t = 16)]
+        hash_power: u8,
+
+        /// Default TTL in seconds (0 = no expiration).
+        #[arg(long, default_value_t = 0)]
+        default_ttl: u32,
+
+        /// Maximum object size to cache in bytes.
+        #[arg(long, default_value_t = 1_048_576)]
+        max_obj_size: u32,
+
+        /// S3-FIFO admission-pool ratio (0.0–1.0, only used with `s3-fifo`).
+        #[arg(long, default_value_t = 0.10)]
+        admission_ratio: f64,
+    },
+
+    /// Simulate using an oracle (offline-optimal) engine.
+    Oracle {
+        /// Oracle eviction policy.
+        #[arg(short, long, default_value = "belady")]
+        policy: OraclePolicyArg,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Argument enums
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, ValueEnum)]
-enum EvictionArg {
-    // -- segcache policies --
+enum SegcachePolicyArg {
     None,
     Random,
     RandomFifo,
     Fifo,
     Cte,
     Util,
-    // -- oracle (offline-optimal) policies --
+    S3Fifo,
+}
+
+impl SegcachePolicyArg {
+    fn into_policy(self, admission_ratio: f64) -> SegcachePolicy {
+        match self {
+            Self::None => SegcachePolicy::None,
+            Self::Random => SegcachePolicy::Random,
+            Self::RandomFifo => SegcachePolicy::RandomFifo,
+            Self::Fifo => SegcachePolicy::Fifo,
+            Self::Cte => SegcachePolicy::Cte,
+            Self::Util => SegcachePolicy::Util,
+            Self::S3Fifo => SegcachePolicy::S3Fifo { admission_ratio },
+        }
+    }
+}
+
+#[derive(Clone, ValueEnum)]
+enum OraclePolicyArg {
     Belady,
     BeladySize,
 }
 
-impl EvictionArg {
-    fn is_oracle(&self) -> bool {
-        matches!(self, Self::Belady | Self::BeladySize)
-    }
-}
-
-impl From<EvictionArg> for segcache::Policy {
-    fn from(p: EvictionArg) -> Self {
+impl From<OraclePolicyArg> for OraclePolicy {
+    fn from(p: OraclePolicyArg) -> Self {
         match p {
-            EvictionArg::None => Self::None,
-            EvictionArg::Random => Self::Random,
-            EvictionArg::RandomFifo => Self::RandomFifo,
-            EvictionArg::Fifo => Self::Fifo,
-            EvictionArg::Cte => Self::Cte,
-            EvictionArg::Util => Self::Util,
-            EvictionArg::Belady | EvictionArg::BeladySize => {
-                unreachable!("oracle policies handled separately")
-            }
+            OraclePolicyArg::Belady => Self::Belady,
+            OraclePolicyArg::BeladySize => Self::BeladySize,
         }
     }
 }
@@ -153,47 +182,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Simulate {
-            trace,
-            cache_size,
-            segment_size,
-            hash_power,
-            eviction,
-            default_ttl,
-            max_obj_size,
-        } => {
+        Command::Simulate(sim) => {
             let cache_size =
-                parse_size(&cache_size).map_err(|e| format!("bad --cache-size: {e}"))?;
+                parse_size(&sim.cache_size).map_err(|e| format!("bad --cache-size: {e}"))?;
 
-            let result = if eviction.is_oracle() {
-                let oracle_policy = match eviction {
-                    EvictionArg::Belady => OraclePolicy::Belady,
-                    EvictionArg::BeladySize => OraclePolicy::BeladySize,
-                    _ => unreachable!(),
-                };
-
-                eprintln!("Running oracle simulation …");
-                eprintln!("  cache size:    {cache_size} bytes");
-                eprintln!("  eviction:      {oracle_policy:?}");
-
-                simulate_oracle(&trace, cache_size, oracle_policy)?
-            } else {
-                let config = SimConfig {
-                    cache_size,
+            let result = match sim.engine {
+                Engine::Segcache {
+                    policy,
                     segment_size,
                     hash_power,
-                    eviction: eviction.into(),
                     default_ttl,
                     max_obj_size,
-                };
+                    admission_ratio,
+                } => {
+                    let config = SimConfig {
+                        cache_size,
+                        segment_size,
+                        hash_power,
+                        eviction: policy.into_policy(admission_ratio),
+                        default_ttl,
+                        max_obj_size,
+                    };
 
-                eprintln!("Running simulation …");
-                eprintln!("  cache size:    {} bytes", config.cache_size);
-                eprintln!("  segment size:  {} bytes", config.segment_size);
-                eprintln!("  hash power:    {}", config.hash_power);
-                eprintln!("  eviction:      {:?}", config.eviction);
+                    eprintln!("Running segcache simulation …");
+                    eprintln!("  cache size:    {} bytes", config.cache_size);
+                    eprintln!("  segment size:  {} bytes", config.segment_size);
+                    eprintln!("  hash power:    {}", config.hash_power);
+                    eprintln!("  eviction:      {:?}", config.eviction);
 
-                simulate(&trace, &config)?
+                    simulate(&sim.trace, &config)?
+                }
+
+                Engine::Oracle { policy } => {
+                    let oracle_policy: OraclePolicy = policy.into();
+
+                    eprintln!("Running oracle simulation …");
+                    eprintln!("  cache size:    {cache_size} bytes");
+                    eprintln!("  eviction:      {oracle_policy:?}");
+
+                    simulate_oracle(&sim.trace, cache_size, oracle_policy)?
+                }
             };
 
             println!("{result}");
