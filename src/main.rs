@@ -5,10 +5,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{simulate, simulate_oracle, SimConfig};
-use cachesim::SegcachePolicy;
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
 };
+use cachesim::SegcachePolicy;
 
 // ---------------------------------------------------------------------------
 // CLI definition
