@@ -3,8 +3,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use cachesim::simulator::{SimConfig, simulate};
-use cachesim::trace::{BinFormat, TraceReader, convert_bin_to_parquet, convert_cache_trace_to_parquet};
+use cachesim::simulator::{simulate, SimConfig};
+use cachesim::trace::{
+    convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
+};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -214,9 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if total > 0 {
                 let duration_ns = max_ts.saturating_sub(min_ts);
                 let duration_s = duration_ns as f64 / 1_000_000_000.0;
-                println!(
-                    "  time range:      {min_ts} – {max_ts} ns ({duration_s:.3} s)",
-                );
+                println!("  time range:      {min_ts} – {max_ts} ns ({duration_s:.3} s)",);
                 println!("  object sizes:    {min_size} – {max_size} bytes");
                 println!(
                     "  avg object size: {:.1} bytes",

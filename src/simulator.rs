@@ -52,7 +52,7 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             cache_size: 64 * 1024 * 1024, // 64 MiB
-            segment_size: 1024 * 1024,     // 1 MiB
+            segment_size: 1024 * 1024,    // 1 MiB
             hash_power: 16,
             eviction: Policy::Fifo,
             default_ttl: 0,

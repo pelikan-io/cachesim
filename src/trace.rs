@@ -200,26 +200,34 @@ impl Iterator for TraceReader {
             let i = self.row_idx;
             self.row_idx += 1;
 
-            let timestamp = col_ts_ns(batch, "timestamp").map(|a| a.value(i)).unwrap_or(0);
+            let timestamp = col_ts_ns(batch, "timestamp")
+                .map(|a| a.value(i))
+                .unwrap_or(0);
             let obj_id = col_u64(batch, "obj_id").map(|a| a.value(i)).unwrap_or(0);
             let obj_size = col_u32(batch, "obj_size").map(|a| a.value(i)).unwrap_or(0);
             let next_access_vtime = col_i64(batch, "next_access_vtime")
                 .map(|a| a.value(i))
                 .unwrap_or(-1);
-            let op = col_u8(batch, "op").and_then(|a| {
-                if a.is_null(i) {
-                    None
-                } else {
-                    Some(a.value(i))
-                }
-            });
-            let ttl = col_i32(batch, "ttl").and_then(|a| {
-                if a.is_null(i) {
-                    None
-                } else {
-                    Some(a.value(i))
-                }
-            });
+            let op =
+                col_u8(batch, "op").and_then(
+                    |a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i))
+                        }
+                    },
+                );
+            let ttl =
+                col_i32(batch, "ttl").and_then(
+                    |a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i))
+                        }
+                    },
+                );
 
             return Some(TraceEntry {
                 timestamp,
@@ -334,7 +342,9 @@ impl TraceWriter {
             ),
             Arc::new(UInt64Array::from(std::mem::take(&mut self.obj_ids))),
             Arc::new(UInt32Array::from(std::mem::take(&mut self.obj_sizes))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.next_access_vtimes))),
+            Arc::new(Int64Array::from(std::mem::take(
+                &mut self.next_access_vtimes,
+            ))),
             Arc::new(UInt8Array::from(std::mem::take(&mut self.ops))),
             Arc::new(Int32Array::from(std::mem::take(&mut self.ttls))),
         ];
@@ -388,7 +398,7 @@ pub fn convert_bin_to_parquet(
     let file_len = file.metadata()?.len() as usize;
     let rec_size = format.record_size();
 
-    if file_len % rec_size != 0 {
+    if !file_len.is_multiple_of(rec_size) {
         return Err(Error::InvalidFormat(format!(
             "file size ({file_len}) is not a multiple of record size ({rec_size})"
         )));
@@ -467,12 +477,11 @@ pub fn convert_cache_trace_to_parquet(
     let path = input.as_ref();
     let file = File::open(path)?;
 
-    let reader: Box<dyn BufRead> =
-        if path.extension().is_some_and(|e| e == "zst" || e == "zstd") {
-            Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
-        } else {
-            Box::new(BufReader::new(file))
-        };
+    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "zst" || e == "zstd") {
+        Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
+    } else {
+        Box::new(BufReader::new(file))
+    };
 
     let hash_state = ahash::RandomState::with_seeds(0, 0, 0, 0);
     let mut writer = TraceWriter::create(output, batch_size)?;
@@ -493,7 +502,10 @@ pub fn convert_cache_trace_to_parquet(
 }
 
 /// Parse one CSV line from a pelikan-io/cache-trace file.
-fn parse_cache_trace_line(line: &str, hash_state: &ahash::RandomState) -> Result<TraceEntry, Error> {
+fn parse_cache_trace_line(
+    line: &str,
+    hash_state: &ahash::RandomState,
+) -> Result<TraceEntry, Error> {
     // Fields: timestamp, key, key_size, value_size, client_id, operation, ttl
     let mut fields = line.splitn(7, ',');
 
@@ -681,10 +693,21 @@ mod tests {
         let arrow_schema = builder.schema();
 
         // Column names
-        let names: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let names: Vec<&str> = arrow_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert_eq!(
             names,
-            &["timestamp", "obj_id", "obj_size", "next_access_vtime", "op", "ttl"]
+            &[
+                "timestamp",
+                "obj_id",
+                "obj_size",
+                "next_access_vtime",
+                "op",
+                "ttl"
+            ]
         );
 
         // Timestamp column carries Nanosecond + UTC metadata
@@ -708,7 +731,8 @@ mod tests {
             bin_data.extend_from_slice(&(i * 10).to_le_bytes());
             bin_data.extend_from_slice(&((i as u64 + 1) * 1000).to_le_bytes());
             bin_data.extend_from_slice(&((i + 1) * 256).to_le_bytes());
-            bin_data.extend_from_slice(&(if i < 2 { (i as i64 + 1) * 5 } else { -1i64 }).to_le_bytes());
+            bin_data
+                .extend_from_slice(&(if i < 2 { (i as i64 + 1) * 5 } else { -1i64 }).to_le_bytes());
         }
         std::fs::write(&bin_path, &bin_data).unwrap();
 
