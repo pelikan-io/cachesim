@@ -1,7 +1,7 @@
-//! Trace data model, Parquet I/O, and libCacheSim binary format conversion.
+//! Trace data model, Parquet I/O, and format conversion.
 //!
 //! The on-disk format is Parquet. The schema is compatible with libCacheSim's
-//! `oracleGeneral` binary trace format (24 bytes/record):
+//! `oracleGeneral` binary trace format:
 //!
 //! | Field              | Type   | Bytes | Description                        |
 //! |--------------------|--------|-------|------------------------------------|
@@ -12,9 +12,14 @@
 //!
 //! Two optional extension columns (`op`, `ttl`) support the richer
 //! `oracleGeneralOpNs` format and workloads with mixed operations.
+//!
+//! In addition to libCacheSim binary formats, this module can import
+//! [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV
+//! files (optionally zstd-compressed).
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::hash::{BuildHasher, Hasher};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -423,6 +428,116 @@ fn parse_oracle_general_opns(buf: &[u8]) -> TraceEntry {
 }
 
 // ---------------------------------------------------------------------------
+// pelikan-io/cache-trace CSV import
+// ---------------------------------------------------------------------------
+
+/// Convert a [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace)
+/// CSV file to Parquet.
+///
+/// CSV columns (no header): `timestamp,key,key_size,value_size,client_id,op,ttl`
+///
+/// * `timestamp` (seconds) is widened to u64 nanoseconds.
+/// * `key` is hashed to a deterministic `u64` via ahash (fixed seed).
+/// * `obj_size` = `key_size + value_size`.
+/// * `next_access_vtime` is set to `-1` (not available in CSV).
+/// * Files with a `.zst` extension are decompressed automatically.
+///
+/// Returns the number of records converted.
+pub fn convert_cache_trace_to_parquet(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    batch_size: usize,
+) -> Result<usize, Error> {
+    let path = input.as_ref();
+    let file = File::open(path)?;
+
+    let reader: Box<dyn BufRead> =
+        if path.extension().is_some_and(|e| e == "zst" || e == "zstd") {
+            Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
+        } else {
+            Box::new(BufReader::new(file))
+        };
+
+    let hash_state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+    let mut writer = TraceWriter::create(output, batch_size)?;
+    let mut count: usize = 0;
+
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if line.is_empty() {
+            continue;
+        }
+        let entry = parse_cache_trace_line(&line, &hash_state)?;
+        writer.write(&entry)?;
+        count += 1;
+    }
+
+    writer.finish()?;
+    Ok(count)
+}
+
+/// Parse one CSV line from a pelikan-io/cache-trace file.
+fn parse_cache_trace_line(line: &str, hash_state: &ahash::RandomState) -> Result<TraceEntry, Error> {
+    // Fields: timestamp, key, key_size, value_size, client_id, operation, ttl
+    let mut fields = line.splitn(7, ',');
+
+    let ts_str = fields.next().ok_or_else(|| bad_csv("missing timestamp"))?;
+    let key = fields.next().ok_or_else(|| bad_csv("missing key"))?;
+    let ks_str = fields.next().ok_or_else(|| bad_csv("missing key_size"))?;
+    let vs_str = fields.next().ok_or_else(|| bad_csv("missing value_size"))?;
+    let _client = fields.next().ok_or_else(|| bad_csv("missing client_id"))?;
+    let op_str = fields.next().ok_or_else(|| bad_csv("missing operation"))?;
+    let ttl_str = fields.next().ok_or_else(|| bad_csv("missing ttl"))?;
+
+    let timestamp_secs: u64 = ts_str
+        .parse()
+        .map_err(|e| bad_csv(&format!("bad timestamp '{ts_str}': {e}")))?;
+    let key_size: u32 = ks_str
+        .parse()
+        .map_err(|e| bad_csv(&format!("bad key_size '{ks_str}': {e}")))?;
+    let value_size: u32 = vs_str
+        .parse()
+        .map_err(|e| bad_csv(&format!("bad value_size '{vs_str}': {e}")))?;
+    let ttl: i32 = ttl_str
+        .trim_end()
+        .parse()
+        .map_err(|e| bad_csv(&format!("bad ttl '{ttl_str}': {e}")))?;
+
+    // Deterministic hash of the key string → obj_id
+    let mut hasher = hash_state.build_hasher();
+    hasher.write(key.as_bytes());
+    let obj_id = hasher.finish();
+
+    let op = match op_str {
+        "get" => Op::Get,
+        "gets" => Op::Gets,
+        "set" => Op::Set,
+        "add" => Op::Add,
+        "cas" => Op::Cas,
+        "replace" => Op::Replace,
+        "append" => Op::Append,
+        "prepend" => Op::Prepend,
+        "delete" => Op::Delete,
+        "incr" => Op::Incr,
+        "decr" => Op::Decr,
+        _ => Op::Invalid,
+    };
+
+    Ok(TraceEntry {
+        timestamp: timestamp_secs * NANOS_PER_SEC,
+        obj_id,
+        obj_size: key_size.saturating_add(value_size),
+        next_access_vtime: -1,
+        op: Some(op as u8),
+        ttl: if ttl > 0 { Some(ttl) } else { None },
+    })
+}
+
+fn bad_csv(msg: &str) -> Error {
+    Error::InvalidFormat(format!("cache-trace CSV: {msg}"))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -572,5 +687,74 @@ mod tests {
         assert!(Op::Delete.is_delete());
         assert!(!Op::Delete.is_read());
         assert!(!Op::Delete.is_write());
+    }
+
+    #[test]
+    fn parse_cache_trace_csv_line() {
+        let state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+        let line = "1583990400,nz:u:eeW511W3dcH3de3d15ec,22,304,127,get,0";
+        let entry = parse_cache_trace_line(line, &state).unwrap();
+
+        assert_eq!(entry.timestamp, 1_583_990_400 * NANOS_PER_SEC);
+        assert_eq!(entry.obj_size, 22 + 304);
+        assert_eq!(entry.op, Some(Op::Get as u8));
+        assert_eq!(entry.ttl, None); // ttl=0 → None
+        assert_eq!(entry.next_access_vtime, -1);
+        // obj_id is a deterministic hash of the key
+        assert_ne!(entry.obj_id, 0);
+    }
+
+    #[test]
+    fn parse_cache_trace_csv_set_with_ttl() {
+        let state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+        let line = "1583990401,abc:key123,10,512,42,set,3600";
+        let entry = parse_cache_trace_line(line, &state).unwrap();
+
+        assert_eq!(entry.timestamp, 1_583_990_401 * NANOS_PER_SEC);
+        assert_eq!(entry.obj_size, 10 + 512);
+        assert_eq!(entry.op, Some(Op::Set as u8));
+        assert_eq!(entry.ttl, Some(3600));
+    }
+
+    #[test]
+    fn parse_cache_trace_deterministic_hash() {
+        let state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+        let line1 = "0,mykey,4,100,1,get,0";
+        let line2 = "1,mykey,4,100,2,get,0";
+        let e1 = parse_cache_trace_line(line1, &state).unwrap();
+        let e2 = parse_cache_trace_line(line2, &state).unwrap();
+        // Same key → same obj_id regardless of other fields
+        assert_eq!(e1.obj_id, e2.obj_id);
+    }
+
+    #[test]
+    fn cache_trace_to_parquet_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("trace.csv");
+        let pq_path = dir.path().join("trace.parquet");
+
+        let csv_data = "\
+1583990400,nz:u:key1,10,200,1,get,0
+1583990401,nz:u:key2,15,500,2,set,7200
+1583990402,nz:u:key1,10,200,1,delete,0
+";
+        std::fs::write(&csv_path, csv_data).unwrap();
+
+        let count = convert_cache_trace_to_parquet(&csv_path, &pq_path, 1024).unwrap();
+        assert_eq!(count, 3);
+
+        let reader = TraceReader::open(&pq_path).unwrap();
+        let entries: Vec<TraceEntry> = reader.collect();
+        assert_eq!(entries.len(), 3);
+
+        // First and third entries share the same key → same obj_id
+        assert_eq!(entries[0].obj_id, entries[2].obj_id);
+        // Different keys → different obj_ids
+        assert_ne!(entries[0].obj_id, entries[1].obj_id);
+
+        assert_eq!(entries[0].op, Some(Op::Get as u8));
+        assert_eq!(entries[1].op, Some(Op::Set as u8));
+        assert_eq!(entries[1].ttl, Some(7200));
+        assert_eq!(entries[2].op, Some(Op::Delete as u8));
     }
 }

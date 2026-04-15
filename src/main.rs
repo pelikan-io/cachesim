@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use cachesim::simulator::{SimConfig, simulate};
-use cachesim::trace::{BinFormat, TraceReader, convert_bin_to_parquet};
+use cachesim::trace::{BinFormat, TraceReader, convert_bin_to_parquet, convert_cache_trace_to_parquet};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -52,9 +52,9 @@ enum Command {
         max_obj_size: u32,
     },
 
-    /// Convert a libCacheSim binary trace to Parquet.
+    /// Convert a trace file to Parquet.
     Convert {
-        /// Input binary trace file.
+        /// Input trace file.
         #[arg(short, long)]
         input: PathBuf,
 
@@ -62,9 +62,9 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Binary format of the input file.
+        /// Format of the input file.
         #[arg(short, long, default_value = "oracle-general")]
-        format: BinFormatArg,
+        format: InputFormatArg,
     },
 
     /// Print statistics about a Parquet trace file.
@@ -102,19 +102,14 @@ impl From<EvictionArg> for segcache::Policy {
     }
 }
 
-#[derive(Clone, ValueEnum)]
-enum BinFormatArg {
+#[derive(Clone, Debug, ValueEnum)]
+enum InputFormatArg {
+    /// libCacheSim oracleGeneral binary (24 B/record)
     OracleGeneral,
+    /// libCacheSim oracleGeneralOpNs binary (27 B/record)
     OracleGeneralOpNs,
-}
-
-impl From<BinFormatArg> for BinFormat {
-    fn from(f: BinFormatArg) -> Self {
-        match f {
-            BinFormatArg::OracleGeneral => Self::OracleGeneral,
-            BinFormatArg::OracleGeneralOpNs => Self::OracleGeneralOpNs,
-        }
-    }
+    /// pelikan-io/cache-trace CSV (optionally zstd-compressed)
+    CacheTrace,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,9 +173,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             format,
         } => {
-            let fmt: BinFormat = format.into();
-            eprintln!("Converting {fmt:?} trace …");
-            let count = convert_bin_to_parquet(&input, &output, fmt, 65_536)?;
+            eprintln!("Converting {:?} trace …", format);
+            let count = match format {
+                InputFormatArg::OracleGeneral => {
+                    convert_bin_to_parquet(&input, &output, BinFormat::OracleGeneral, 65_536)?
+                }
+                InputFormatArg::OracleGeneralOpNs => {
+                    convert_bin_to_parquet(&input, &output, BinFormat::OracleGeneralOpNs, 65_536)?
+                }
+                InputFormatArg::CacheTrace => {
+                    convert_cache_trace_to_parquet(&input, &output, 65_536)?
+                }
+            };
             eprintln!("Converted {count} entries → {}", output.display());
         }
 

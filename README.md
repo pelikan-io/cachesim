@@ -89,12 +89,38 @@ offset  size  type     field
 
 During import, the u32-second timestamps are widened to u64 nanoseconds.
 
+### pelikan-io/cache-trace CSV
+
+cachesim can also import
+[pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV files
+(Twitter production Memcache traces). Files with a `.zst` extension are
+decompressed automatically.
+
+CSV columns (no header row):
+
+```
+timestamp,key,key_size,value_size,client_id,operation,ttl
+```
+
+Field mapping during import:
+
+| CSV field     | Parquet column       | Transformation                              |
+|---------------|----------------------|---------------------------------------------|
+| `timestamp`   | `timestamp`          | seconds -> nanoseconds (`* 1_000_000_000`)  |
+| `key`         | `obj_id`             | deterministic hash (ahash, fixed seed)      |
+| `key_size`    | `obj_size` (partial) | `key_size + value_size`                     |
+| `value_size`  | `obj_size` (partial) | `key_size + value_size`                     |
+| `client_id`   | —                    | not stored                                  |
+| `operation`   | `op`                 | string -> `req_op_e` integer                |
+| `ttl`         | `ttl`                | 0 -> null, >0 -> Some                       |
+| —             | `next_access_vtime`  | set to `-1` (not available in CSV)          |
+
 ## Code Architecture
 
 ```
 src/
 ├── lib.rs          # Crate root, module declarations, Error type
-├── trace.rs        # Trace data model, Parquet I/O, binary format parsing
+├── trace.rs        # Trace data model, Parquet I/O, format conversion
 ├── simulator.rs    # Cache simulation engine
 └── main.rs         # CLI (clap)
 ```
@@ -107,6 +133,8 @@ src/
   them to a ZSTD-compressed Parquet file.
 - **`convert_bin_to_parquet()`** — streaming conversion from libCacheSim binary
   format to Parquet.
+- **`convert_cache_trace_to_parquet()`** — streaming conversion from
+  pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
 - **`Op`** — operation enum matching `req_op_e`, with `is_read()` /
   `is_write()` / `is_delete()` classification helpers.
 
@@ -130,7 +158,7 @@ Three subcommands:
 | Command     | Description                                      |
 |-------------|--------------------------------------------------|
 | `simulate`  | Replay a Parquet trace against segcache           |
-| `convert`   | Import a libCacheSim binary trace to Parquet      |
+| `convert`   | Import a trace to Parquet (binary or CSV)          |
 | `info`      | Print summary statistics for a Parquet trace file |
 
 ## Usage
@@ -138,6 +166,9 @@ Three subcommands:
 ```bash
 # Convert a libCacheSim binary trace to Parquet
 cachesim convert -i trace.oracleGeneral.bin -o trace.parquet
+
+# Convert a pelikan-io/cache-trace CSV (zstd-compressed)
+cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
 
 # Run a simulation (64 MB cache, FIFO eviction)
 cachesim simulate -t trace.parquet -c 64M -e fifo
