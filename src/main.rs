@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use cachesim::oracle::OraclePolicy;
-use cachesim::simulator::{simulate, simulate_oracle, SimConfig};
+use cachesim::simulator::{
+    simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig,
+};
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
 };
-use cachesim::SegcachePolicy;
+use cachesim::{CuckooPolicy, SegcachePolicy};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -95,6 +97,33 @@ enum Engine {
         admission_ratio: f64,
     },
 
+    /// Simulate using the cuckoo-cache engine (fixed-size item slots).
+    Cuckoo {
+        /// Eviction policy.
+        #[arg(short, long, default_value = "random")]
+        policy: CuckooPolicyArg,
+
+        /// Fixed byte size per item slot.
+        #[arg(long, default_value_t = 64)]
+        item_size: usize,
+
+        /// Maximum displacement chain depth before eviction.
+        #[arg(long, default_value_t = 16)]
+        max_displace: usize,
+
+        /// Maximum TTL the cache will accept (seconds).
+        #[arg(long, default_value_t = 2_592_000)]
+        max_ttl: u32,
+
+        /// Default TTL in seconds (0 = no expiration).
+        #[arg(long, default_value_t = 0)]
+        default_ttl: u32,
+
+        /// Maximum object size to cache in bytes.
+        #[arg(long, default_value_t = 1_048_576)]
+        max_obj_size: u32,
+    },
+
     /// Simulate using an oracle (offline-optimal) engine.
     Oracle {
         /// Oracle eviction policy.
@@ -128,6 +157,21 @@ impl SegcachePolicyArg {
             Self::Cte => SegcachePolicy::Cte,
             Self::Util => SegcachePolicy::Util,
             Self::S3Fifo => SegcachePolicy::S3Fifo { admission_ratio },
+        }
+    }
+}
+
+#[derive(Clone, ValueEnum)]
+enum CuckooPolicyArg {
+    Random,
+    Expire,
+}
+
+impl From<CuckooPolicyArg> for CuckooPolicy {
+    fn from(p: CuckooPolicyArg) -> Self {
+        match p {
+            CuckooPolicyArg::Random => Self::Random,
+            CuckooPolicyArg::Expire => Self::Expire,
         }
     }
 }
@@ -210,7 +254,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("  hash power:    {}", config.hash_power);
                     eprintln!("  eviction:      {:?}", config.eviction);
 
-                    simulate(&sim.trace, &config)?
+                    simulate_segcache(&sim.trace, &config)?
+                }
+
+                Engine::Cuckoo {
+                    policy,
+                    item_size,
+                    max_displace,
+                    max_ttl,
+                    default_ttl,
+                    max_obj_size,
+                } => {
+                    let nitem = cache_size / item_size;
+                    let config = CuckooConfig {
+                        nitem,
+                        item_size,
+                        max_displace,
+                        eviction: policy.into(),
+                        default_ttl,
+                        max_ttl,
+                        max_obj_size,
+                    };
+
+                    eprintln!("Running cuckoo-cache simulation …");
+                    eprintln!("  cache size:      {} bytes", cache_size);
+                    eprintln!("  item size:       {} bytes", config.item_size);
+                    eprintln!("  nitem:           {}", config.nitem);
+                    eprintln!("  max displace:    {}", config.max_displace);
+                    eprintln!("  eviction:        {:?}", config.eviction);
+
+                    simulate_cuckoo(&sim.trace, &config)?
                 }
 
                 Engine::Oracle { policy } => {

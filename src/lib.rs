@@ -3,6 +3,28 @@ pub mod simulator;
 pub mod trace;
 
 // ---------------------------------------------------------------------------
+// Cuckoo-cache eviction policies
+// ---------------------------------------------------------------------------
+
+/// Eviction policies backed by the cuckoo-cache engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuckooPolicy {
+    /// Randomly select a candidate slot for eviction.
+    Random,
+    /// Prefer evicting items nearest to expiration.
+    Expire,
+}
+
+impl From<CuckooPolicy> for cuckoo_cache::Policy {
+    fn from(p: CuckooPolicy) -> Self {
+        match p {
+            CuckooPolicy::Random => Self::Random,
+            CuckooPolicy::Expire => Self::Expire,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Segcache eviction policies
 // ---------------------------------------------------------------------------
 
@@ -59,8 +81,11 @@ pub enum Error {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
-    #[error("Cache error: {0}")]
-    Cache(#[from] segcache::SegcacheError),
+    #[error("Segcache error: {0}")]
+    Segcache(#[from] segcache::SegcacheError),
+
+    #[error("Cuckoo-cache error: {0}")]
+    Cuckoo(#[from] cuckoo_cache::CuckooCacheError),
 
     #[error("Invalid format: {0}")]
     InvalidFormat(String),

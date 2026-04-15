@@ -19,6 +19,7 @@ ahash = "0.8"
 arrow = { version = "54", default-features = false, features = ["prettyprint"] }
 clap = { version = "4", features = ["derive"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
+cuckoo-cache = { git = "https://github.com/pelikan-io/cache-rs", default-features = false }
 segcache = { version = "0.2.0", default-features = false }
 thiserror = "2"
 zstd = "0.13"
