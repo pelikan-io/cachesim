@@ -1,5 +1,5 @@
 [package]
-name = "cachesim"
+name = "cachesim-rs"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ ahash = "0.8"
 arrow = { version = "54", default-features = false, features = ["prettyprint"] }
 clap = { version = "4", features = ["derive"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
-segcache = { git = "https://github.com/pelikan-io/cache-rs.git", default-features = false }
+segcache = { version = "0.1.1", default-features = false }
 thiserror = "2"
 zstd = "0.13"
 
