@@ -5,7 +5,7 @@
 //!
 //! | Field              | Type   | Bytes | Description                        |
 //! |--------------------|--------|-------|------------------------------------|
-//! | timestamp          | u32    | 4     | Real time (seconds since epoch)    |
+//! | timestamp          | u64    | 8     | Real time (nanoseconds since epoch)|
 //! | obj_id             | u64    | 8     | Object identifier                  |
 //! | obj_size           | u32    | 4     | Object size in bytes               |
 //! | next_access_vtime  | i64    | 8     | Virtual time of next access        |
@@ -111,8 +111,8 @@ impl Op {
 /// A single trace request, field-compatible with libCacheSim's oracleGeneral.
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
-    /// Real time (seconds since epoch).
-    pub timestamp: u32,
+    /// Real time (nanoseconds since epoch).
+    pub timestamp: u64,
     /// Object identifier.
     pub obj_id: u64,
     /// Object size in bytes.
@@ -133,7 +133,7 @@ pub struct TraceEntry {
 /// Canonical Arrow schema for cachesim trace files.
 pub fn trace_schema() -> Schema {
     Schema::new(vec![
-        Field::new("timestamp", DataType::UInt32, false),
+        Field::new("timestamp", DataType::UInt64, false),
         Field::new("obj_id", DataType::UInt64, false),
         Field::new("obj_size", DataType::UInt32, false),
         Field::new("next_access_vtime", DataType::Int64, false),
@@ -187,7 +187,7 @@ impl Iterator for TraceReader {
             let i = self.row_idx;
             self.row_idx += 1;
 
-            let timestamp = col_u32(batch, "timestamp").map(|a| a.value(i)).unwrap_or(0);
+            let timestamp = col_u64(batch, "timestamp").map(|a| a.value(i)).unwrap_or(0);
             let obj_id = col_u64(batch, "obj_id").map(|a| a.value(i)).unwrap_or(0);
             let obj_size = col_u32(batch, "obj_size").map(|a| a.value(i)).unwrap_or(0);
             let next_access_vtime = col_i64(batch, "next_access_vtime")
@@ -257,7 +257,7 @@ pub struct TraceWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
     // Column buffers
-    timestamps: Vec<u32>,
+    timestamps: Vec<u64>,
     obj_ids: Vec<u64>,
     obj_sizes: Vec<u32>,
     next_access_vtimes: Vec<i64>,
@@ -310,7 +310,7 @@ impl TraceWriter {
         }
 
         let arrays: Vec<ArrayRef> = vec![
-            Arc::new(UInt32Array::from(std::mem::take(&mut self.timestamps))),
+            Arc::new(UInt64Array::from(std::mem::take(&mut self.timestamps))),
             Arc::new(UInt64Array::from(std::mem::take(&mut self.obj_ids))),
             Arc::new(UInt32Array::from(std::mem::take(&mut self.obj_sizes))),
             Arc::new(Int64Array::from(std::mem::take(&mut self.next_access_vtimes))),
@@ -391,10 +391,14 @@ pub fn convert_bin_to_parquet(
     Ok(num_records)
 }
 
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+
 /// Parse a 24-byte oracleGeneral record (little-endian, packed).
+/// The on-wire timestamp is u32 seconds; we widen to u64 nanoseconds.
 fn parse_oracle_general(buf: &[u8]) -> TraceEntry {
+    let secs = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     TraceEntry {
-        timestamp: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        timestamp: secs as u64 * NANOS_PER_SEC,
         obj_id: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
         obj_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
         next_access_vtime: i64::from_le_bytes(buf[16..24].try_into().unwrap()),
@@ -404,9 +408,11 @@ fn parse_oracle_general(buf: &[u8]) -> TraceEntry {
 }
 
 /// Parse a 27-byte oracleGeneralOpNs record (little-endian, packed).
+/// The on-wire timestamp is u32 seconds; we widen to u64 nanoseconds.
 fn parse_oracle_general_opns(buf: &[u8]) -> TraceEntry {
+    let secs = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     TraceEntry {
-        timestamp: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        timestamp: secs as u64 * NANOS_PER_SEC,
         obj_id: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
         obj_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
         op: Some(buf[16]),
@@ -426,27 +432,24 @@ mod tests {
 
     #[test]
     fn parse_oracle_general_roundtrip() {
-        let entry = TraceEntry {
-            timestamp: 1_700_000_000,
-            obj_id: 0xDEAD_BEEF_CAFE_BABE,
-            obj_size: 4096,
-            next_access_vtime: 42,
-            op: None,
-            ttl: None,
-        };
+        let ts_secs: u32 = 1_700_000_000;
+        let obj_id: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let obj_size: u32 = 4096;
+        let next_vtime: i64 = 42;
 
-        // Serialize to the 24-byte format
+        // Serialize to the 24-byte on-wire format (timestamp is u32 seconds)
         let mut buf = [0u8; 24];
-        buf[0..4].copy_from_slice(&entry.timestamp.to_le_bytes());
-        buf[4..12].copy_from_slice(&entry.obj_id.to_le_bytes());
-        buf[12..16].copy_from_slice(&entry.obj_size.to_le_bytes());
-        buf[16..24].copy_from_slice(&entry.next_access_vtime.to_le_bytes());
+        buf[0..4].copy_from_slice(&ts_secs.to_le_bytes());
+        buf[4..12].copy_from_slice(&obj_id.to_le_bytes());
+        buf[12..16].copy_from_slice(&obj_size.to_le_bytes());
+        buf[16..24].copy_from_slice(&next_vtime.to_le_bytes());
 
         let parsed = parse_oracle_general(&buf);
-        assert_eq!(parsed.timestamp, entry.timestamp);
-        assert_eq!(parsed.obj_id, entry.obj_id);
-        assert_eq!(parsed.obj_size, entry.obj_size);
-        assert_eq!(parsed.next_access_vtime, entry.next_access_vtime);
+        // Binary parser widens u32 seconds → u64 nanoseconds
+        assert_eq!(parsed.timestamp, ts_secs as u64 * NANOS_PER_SEC);
+        assert_eq!(parsed.obj_id, obj_id);
+        assert_eq!(parsed.obj_size, obj_size);
+        assert_eq!(parsed.next_access_vtime, next_vtime);
         assert!(parsed.op.is_none());
         assert!(parsed.ttl.is_none());
     }
@@ -462,7 +465,7 @@ mod tests {
         buf[19..27].copy_from_slice(&(-1i64).to_le_bytes());
 
         let parsed = parse_oracle_general_opns(&buf);
-        assert_eq!(parsed.timestamp, 100);
+        assert_eq!(parsed.timestamp, 100 * NANOS_PER_SEC);
         assert_eq!(parsed.obj_id, 999);
         assert_eq!(parsed.obj_size, 512);
         assert_eq!(parsed.op, Some(1));
@@ -546,7 +549,7 @@ mod tests {
         let reader = TraceReader::open(&pq_path).unwrap();
         let entries: Vec<TraceEntry> = reader.collect();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].timestamp, 0);
+        assert_eq!(entries[0].timestamp, 0); // 0 seconds → 0 nanoseconds
         assert_eq!(entries[0].obj_id, 1000);
         assert_eq!(entries[0].obj_size, 256);
         assert_eq!(entries[1].obj_id, 2000);

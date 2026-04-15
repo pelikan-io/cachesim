@@ -188,8 +188,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reader = TraceReader::open(&trace)?;
             let total = reader.total_entries();
 
-            let mut min_ts = u32::MAX;
-            let mut max_ts = 0u32;
+            let mut min_ts = u64::MAX;
+            let mut max_ts = 0u64;
             let mut min_size = u32::MAX;
             let mut max_size = 0u32;
             let mut total_size: u64 = 0;
@@ -208,9 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  total requests:  {total}");
             println!("  unique objects:  {}", unique_ids.len());
             if total > 0 {
+                let duration_ns = max_ts.saturating_sub(min_ts);
+                let duration_s = duration_ns as f64 / 1_000_000_000.0;
                 println!(
-                    "  time range:      {min_ts} – {max_ts} ({} s)",
-                    max_ts.saturating_sub(min_ts)
+                    "  time range:      {min_ts} – {max_ts} ns ({duration_s:.3} s)",
                 );
                 println!("  object sizes:    {min_size} – {max_size} bytes");
                 println!(
