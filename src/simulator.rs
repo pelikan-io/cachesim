@@ -115,7 +115,10 @@ impl std::fmt::Display for SimResult {
 // ---------------------------------------------------------------------------
 
 /// Run a cache simulation by replaying `trace_path` against segcache.
-pub fn simulate_segcache(trace_path: impl AsRef<Path>, config: &SimConfig) -> Result<SimResult, Error> {
+pub fn simulate_segcache(
+    trace_path: impl AsRef<Path>,
+    config: &SimConfig,
+) -> Result<SimResult, Error> {
     let reader = TraceReader::open(trace_path)?;
 
     let mut cache = Segcache::builder()

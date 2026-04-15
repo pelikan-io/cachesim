@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use cachesim::oracle::OraclePolicy;
-use cachesim::simulator::{simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig};
+use cachesim::simulator::{
+    simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig,
+};
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
 };
