@@ -195,13 +195,16 @@ cachesim convert -i trace.oracleGeneral.bin -o trace.parquet
 cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
 
 # Run a simulation (64 MB cache, FIFO eviction via segcache)
-cachesim simulate -t trace.parquet -c 64M -e fifo
+cachesim simulate -t trace.parquet -c 64M segcache -p fifo
+
+# Run with S3-FIFO and a custom admission ratio
+cachesim simulate -t trace.parquet -c 64M segcache -p s3-fifo --admission-ratio 0.15
 
 # Run a Belady (optimal) simulation as a reference baseline
-cachesim simulate -t trace.parquet -c 64M -e belady
+cachesim simulate -t trace.parquet -c 64M oracle -p belady
 
 # Run a size-aware optimal simulation
-cachesim simulate -t trace.parquet -c 64M -e belady-size
+cachesim simulate -t trace.parquet -c 64M oracle -p belady-size
 
 # Inspect a trace
 cachesim info -t trace.parquet
@@ -209,29 +212,44 @@ cachesim info -t trace.parquet
 
 ### Simulate options
 
+Shared options (before the engine subcommand):
+
 ```
 -t, --trace <PATH>         Parquet trace file (required)
 -c, --cache-size <SIZE>    Cache size with K/M/G suffix [default: 64M]
--s, --segment-size <N>     Segment size in bytes [default: 1048576]
-    --hash-power <N>       Hash table buckets = 2^N [default: 16]
--e, --eviction <POLICY>    Eviction policy [default: fifo]
-    --default-ttl <SECS>   Default TTL, 0 = none [default: 0]
-    --max-obj-size <N>     Skip objects larger than N bytes [default: 1048576]
 ```
 
-#### Eviction policies
+#### `segcache` engine
 
-| Policy | Engine | Description |
-|--------|--------|-------------|
-| `none` | segcache | No eviction; inserts fail when full |
-| `random` | segcache | Random segment eviction |
-| `random-fifo` | segcache | Random TTL bucket, FIFO within |
-| `fifo` | segcache | First-in first-out |
-| `cte` | segcache | Closest-to-expiration |
-| `util` | segcache | Least-utilized segment |
-| `s3-fifo` | segcache | S3-FIFO: small, main, and ghost FIFO queues |
-| `belady` | oracle | Optimal: evict farthest future access |
-| `belady-size` | oracle | Optimal (size-aware): evict max(distance × size) |
+```
+-p, --policy <POLICY>      Eviction policy [default: fifo]
+-s, --segment-size <N>     Segment size in bytes [default: 1048576]
+    --hash-power <N>       Hash table buckets = 2^N [default: 16]
+    --default-ttl <SECS>   Default TTL, 0 = none [default: 0]
+    --max-obj-size <N>     Skip objects larger than N bytes [default: 1048576]
+    --admission-ratio <F>  S3-FIFO admission-pool ratio [default: 0.10]
+```
+
+| Policy | Description |
+|--------|-------------|
+| `none` | No eviction; inserts fail when full |
+| `random` | Random segment eviction |
+| `random-fifo` | Random TTL bucket, FIFO within |
+| `fifo` | First-in first-out |
+| `cte` | Closest-to-expiration |
+| `util` | Least-utilized segment |
+| `s3-fifo` | S3-FIFO: small, main, and ghost FIFO queues |
+
+#### `oracle` engine
+
+```
+-p, --policy <POLICY>      Oracle eviction policy [default: belady]
+```
+
+| Policy | Description |
+|--------|-------------|
+| `belady` | Optimal: evict farthest future access |
+| `belady-size` | Optimal (size-aware): evict max(distance × size) |
 
 Oracle policies use `next_access_vtime` from the trace and ignore
 segcache-specific options (segment size, hash power, TTL).
