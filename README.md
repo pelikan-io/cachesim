@@ -7,9 +7,13 @@ crates, with a trace format inspired by
 ## Overview
 
 cachesim replays recorded cache workload traces against cache implementations
-from the cache-rs project (currently [segcache](https://github.com/pelikan-io/cache-rs/tree/main/crates/segcache))
-and reports hit/miss statistics. It also includes oracle (offline-optimal)
-eviction policies — Belady and BeladySize — as theoretical baselines.
+from the cache-rs project —
+[segcache](https://github.com/pelikan-io/cache-rs/tree/main/crates/segcache)
+(segment-structured) and
+[cuckoo-cache](https://github.com/pelikan-io/cache-rs/tree/main/crates/cuckoo)
+(cuckoo-hashing with fixed-size item slots) — and reports hit/miss statistics.
+It also includes oracle (offline-optimal) eviction policies — Belady and
+BeladySize — as theoretical baselines.
 
 Traces are stored on disk as [Parquet](https://parquet.apache.org/) files, and
 cachesim can import libCacheSim's binary trace formats and
@@ -164,6 +168,8 @@ theoretical upper bounds when evaluating online policies.
 
 - **`SimConfig`** — all knobs for a segcache run: cache size, segment size,
   hash power, eviction policy, default TTL, max object size.
+- **`CuckooConfig`** — all knobs for a cuckoo-cache run: nitem, item size,
+  max displacement depth, eviction policy, TTL settings, max object size.
 - **`SimResult`** — aggregate counters (hits, misses, inserts, insert failures,
   deletes, skipped) with `hit_rate()` / `miss_rate()`.
 - **`simulate()`** — reads a Parquet trace, builds a `segcache::Segcache`
@@ -172,18 +178,21 @@ theoretical upper bounds when evaluating online policies.
   - *Write* ops → unconditional insert/overwrite.
   - *Delete* ops → remove.
   - Objects exceeding `max_obj_size` are skipped.
+- **`simulate_cuckoo()`** — same replay loop but against a
+  `cuckoo_cache::CuckooCache`. The cache uses fixed-size item slots with
+  cuckoo hashing (D=4 candidate positions per key).
 - **`simulate_oracle()`** — same replay loop but against an `OracleCache`.
-  Only needs cache size and oracle policy (segcache knobs do not apply).
+  Only needs cache size and oracle policy (engine-specific knobs do not apply).
 
 ### CLI (`main.rs`)
 
 Three subcommands:
 
-| Command     | Description                                      |
-|-------------|--------------------------------------------------|
-| `simulate`  | Replay a Parquet trace against segcache or oracle |
-| `convert`   | Import a trace to Parquet (binary or CSV)          |
-| `info`      | Print summary statistics for a Parquet trace file |
+| Command     | Description                                                  |
+|-------------|--------------------------------------------------------------|
+| `simulate`  | Replay a Parquet trace against segcache, cuckoo, or oracle   |
+| `convert`   | Import a trace to Parquet (binary or CSV)                    |
+| `info`      | Print summary statistics for a Parquet trace file            |
 
 ## Usage
 
@@ -199,6 +208,12 @@ cachesim simulate -t trace.parquet -c 64M segcache -p fifo
 
 # Run with S3-FIFO and a custom admission ratio
 cachesim simulate -t trace.parquet -c 64M segcache -p s3-fifo --admission-ratio 0.15
+
+# Run a cuckoo-cache simulation (64 MB cache, 128-byte item slots)
+cachesim simulate -t trace.parquet -c 64M cuckoo --item-size 128
+
+# Run cuckoo-cache with expire eviction policy
+cachesim simulate -t trace.parquet -c 64M cuckoo -p expire --item-size 256
 
 # Run a Belady (optimal) simulation as a reference baseline
 cachesim simulate -t trace.parquet -c 64M oracle -p belady
@@ -239,6 +254,27 @@ Shared options (before the engine subcommand):
 | `cte` | Closest-to-expiration |
 | `util` | Least-utilized segment |
 | `s3-fifo` | S3-FIFO: small, main, and ghost FIFO queues |
+
+#### `cuckoo` engine
+
+```
+-p, --policy <POLICY>      Eviction policy [default: random]
+    --item-size <N>        Fixed byte size per item slot [default: 64]
+    --max-displace <N>     Max displacement chain depth [default: 16]
+    --max-ttl <SECS>       Max TTL the cache accepts [default: 2592000]
+    --default-ttl <SECS>   Default TTL, 0 = none [default: 0]
+    --max-obj-size <N>     Skip objects larger than N bytes [default: 1048576]
+```
+
+| Policy | Description |
+|--------|-------------|
+| `random` | Randomly select a candidate slot for eviction |
+| `expire` | Prefer evicting items nearest to expiration |
+
+The number of item slots is derived from `cache_size / item_size`. Each slot
+is a fixed-size allocation that must fit the key, value, and internal metadata.
+Items that exceed the slot size will fail to insert (counted as insert
+failures).
 
 #### `oracle` engine
 
