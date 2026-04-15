@@ -1,0 +1,30 @@
+[package]
+name = "cachesim"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Cache trace simulator for cache-rs crates, with libCacheSim-compatible trace formats"
+repository = "https://github.com/pelikan-io/cachesim"
+
+[[bin]]
+name = "cachesim"
+path = "src/main.rs"
+
+[lib]
+name = "cachesim"
+path = "src/lib.rs"
+
+[dependencies]
+arrow = { version = "54", default-features = false, features = ["prettyprint"] }
+clap = { version = "4", features = ["derive"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
+segcache = { git = "https://github.com/pelikan-io/cache-rs.git", default-features = false }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
