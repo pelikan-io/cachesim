@@ -27,7 +27,7 @@ src/trace.rs        TraceEntry, TraceReader/Writer, Parquet I/O, format converte
 src/annotate.rs     annotate_next_access(): two-pass next_access_vtime fill
 src/oracle.rs       OracleCache with Belady/BeladySize policies
 src/simulator.rs    SimConfig/CuckooConfig, simulate_segcache()/simulate_cuckoo()/simulate_oracle(), SimResult
-src/main.rs         CLI (clap): simulate, convert, annotate, info subcommands
+src/main.rs         CLI (clap): simulate, mrc, convert, annotate, info subcommands
 ```
 
 ## Architecture
@@ -47,7 +47,7 @@ Each engine has its own config struct, simulation function, and policy enum:
 1. Add dependency to `Cargo.toml`
 2. Add policy enum + `From` impl in `lib.rs`; add error variant to `Error`
 3. Add config struct + `simulate_*()` function in `simulator.rs`
-4. Add `Engine` variant, CLI arg enum, and handler in `main.rs`
+4. Add `Engine` variant, CLI arg enum, and a `run_engine()` arm in `main.rs` (serves both `simulate` and `mrc`)
 5. Add tests in `simulator.rs`
 
 ### Simulation model
