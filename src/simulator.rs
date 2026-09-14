@@ -310,10 +310,12 @@ pub fn simulate_oracle(
     let reader = TraceReader::open(trace_path)?;
     let mut cache = OracleCache::new(capacity, policy);
     let mut result = SimResult::default();
+    let mut annotated = false;
 
     for entry in reader {
         let entry = entry?;
         result.total_requests += 1;
+        annotated |= entry.next_access_vtime >= 0;
 
         if entry.obj_size == 0 {
             result.skipped += 1;
@@ -338,6 +340,16 @@ pub fn simulate_oracle(
                 result.inserts += 1;
             }
         }
+    }
+
+    // A hit means some object was requested twice, so its first row must
+    // have carried a non-negative next_access_vtime. All -1 with hits is a
+    // trace that was never annotated, and the oracle result would be
+    // meaningless rather than merely wrong.
+    if !annotated && result.hits > 0 {
+        return Err(Error::InvalidFormat(
+            "trace has no next_access_vtime data; run `cachesim annotate` first".into(),
+        ));
     }
 
     Ok(result)
@@ -628,6 +640,31 @@ mod tests {
     // -----------------------------------------------------------------------
     // Oracle tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn oracle_refuses_unannotated_trace_with_reuse() {
+        // Two requests for one object, both with the -1 a CSV conversion
+        // leaves behind: the second is a hit, which proves the first row's
+        // -1 is wrong.
+        let entries: Vec<TraceEntry> = (0..2)
+            .map(|i| TraceEntry {
+                timestamp: i,
+                obj_id: 1,
+                obj_size: 8,
+                next_access_vtime: -1,
+                op: None,
+                ttl: None,
+                key_size: None,
+                value_size: None,
+            })
+            .collect();
+        let (_dir, path) = write_synthetic_trace(&entries);
+        let err = simulate_oracle(&path, 100, OraclePolicy::Belady).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidFormat(_)),
+            "expected InvalidFormat, got {err:?}"
+        );
+    }
 
     #[test]
     fn belady_optimal_eviction() {
