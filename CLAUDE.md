@@ -38,7 +38,7 @@ Each engine has its own config struct, simulation function, and policy enum:
 | Engine | Config | Function | Policy enum | Backing crate |
 |--------|--------|----------|-------------|---------------|
 | segcache | `SimConfig` | `simulate_segcache()` | `SegcachePolicy` | `segcache` (crates.io) |
-| cuckoo | `CuckooConfig` | `simulate_cuckoo()` | `CuckooPolicy` | `cuckoo-cache` (git dep) |
+| cuckoo | `CuckooConfig` | `simulate_cuckoo()` | `CuckooPolicy` | `cuckoo-cache` (crates.io) |
 | oracle | params only | `simulate_oracle()` | `OraclePolicy` | in-tree `oracle.rs` |
 
 ### Adding a new engine

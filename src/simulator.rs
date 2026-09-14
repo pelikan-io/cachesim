@@ -121,7 +121,7 @@ pub fn simulate_segcache(
 ) -> Result<SimResult, Error> {
     let reader = TraceReader::open(trace_path)?;
 
-    let mut cache = Segcache::builder()
+    let cache = Segcache::builder()
         .heap_size(config.cache_size)
         .segment_size(config.segment_size)
         .hash_power(config.hash_power)
@@ -271,7 +271,7 @@ pub fn simulate_cuckoo(
             cache.delete(&key);
             result.deletes += 1;
         } else if op.is_write() {
-            match cache.insert(&key, value, None, ttl) {
+            match cache.insert(&key, value, ttl) {
                 Ok(()) => result.inserts += 1,
                 Err(_) => result.insert_failures += 1,
             }
@@ -280,7 +280,7 @@ pub fn simulate_cuckoo(
                 result.hits += 1;
             } else {
                 result.misses += 1;
-                match cache.insert(&key, value, None, ttl) {
+                match cache.insert(&key, value, ttl) {
                     Ok(()) => result.inserts += 1,
                     Err(_) => result.insert_failures += 1,
                 }
