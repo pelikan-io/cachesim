@@ -137,7 +137,9 @@ src/
 ### `trace` module
 
 - **`TraceEntry`** — one cache request (the in-memory row type).
-- **`TraceReader`** — opens a Parquet file, iterates over `TraceEntry` values.
+- **`TraceReader`** — opens a Parquet file and streams `Result<TraceEntry>` values
+  one record batch at a time, so traces larger than memory replay at a fixed
+  footprint. The footer's row count is available up front via `total_entries()`.
 - **`TraceWriter`** — buffers entries into Arrow `RecordBatch`es and writes
   them to a ZSTD-compressed Parquet file.
 - **`convert_bin_to_parquet()`** — streaming conversion from libCacheSim binary

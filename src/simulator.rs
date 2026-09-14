@@ -142,6 +142,7 @@ pub fn simulate_segcache(
     let mut result = SimResult::default();
 
     for entry in reader {
+        let entry = entry?;
         result.total_requests += 1;
 
         if entry.obj_size > config.max_obj_size || entry.obj_size == 0 {
@@ -249,6 +250,7 @@ pub fn simulate_cuckoo(
     let mut result = SimResult::default();
 
     for entry in reader {
+        let entry = entry?;
         result.total_requests += 1;
 
         if entry.obj_size > config.max_obj_size || entry.obj_size == 0 {
@@ -310,6 +312,7 @@ pub fn simulate_oracle(
     let mut result = SimResult::default();
 
     for entry in reader {
+        let entry = entry?;
         result.total_requests += 1;
 
         if entry.obj_size == 0 {

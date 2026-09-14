@@ -29,7 +29,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -159,121 +159,154 @@ pub fn trace_schema() -> Schema {
 // Parquet reader
 // ---------------------------------------------------------------------------
 
-/// Reads trace entries from a Parquet file.
+/// Rows decoded per record batch. Large enough that per-batch overhead is
+/// negligible against a multi-billion-row trace, small enough (a few MiB for
+/// this schema) that the working set stays in cache.
+const READ_BATCH_SIZE: usize = 65_536;
+
+/// Reads trace entries from a Parquet file, one record batch at a time.
+///
+/// The file is never loaded whole: only the current batch is resident, so a
+/// trace larger than memory streams through at a fixed footprint. The total
+/// row count comes from the Parquet footer and is available before the first
+/// row is decoded.
 pub struct TraceReader {
-    batches: Vec<RecordBatch>,
-    batch_idx: usize,
+    batches: ParquetRecordBatchReader,
+    total_entries: usize,
+    current: Option<Columns>,
     row_idx: usize,
+    /// Set once a batch fails to decode; the iterator is exhausted afterwards
+    /// rather than skipping to the next row group and silently dropping rows.
+    failed: bool,
+}
+
+/// The current batch, downcast once so each row is a plain array index rather
+/// than a name lookup plus a dynamic downcast.
+struct Columns {
+    len: usize,
+    timestamp: Option<TimestampNanosecondArray>,
+    obj_id: Option<UInt64Array>,
+    obj_size: Option<UInt32Array>,
+    next_access_vtime: Option<Int64Array>,
+    op: Option<UInt8Array>,
+    ttl: Option<Int32Array>,
+}
+
+impl Columns {
+    fn from_batch(batch: &RecordBatch) -> Self {
+        fn col<T: Array + Clone + 'static>(batch: &RecordBatch, name: &str) -> Option<T> {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<T>())
+                .cloned()
+        }
+        Self {
+            len: batch.num_rows(),
+            timestamp: col(batch, "timestamp"),
+            obj_id: col(batch, "obj_id"),
+            obj_size: col(batch, "obj_size"),
+            next_access_vtime: col(batch, "next_access_vtime"),
+            op: col(batch, "op"),
+            ttl: col(batch, "ttl"),
+        }
+    }
+
+    fn entry(&self, i: usize) -> TraceEntry {
+        fn nullable<A, T>(col: &Option<A>, i: usize, get: impl Fn(&A, usize) -> T) -> Option<T>
+        where
+            A: Array,
+        {
+            col.as_ref().filter(|a| !a.is_null(i)).map(|a| get(a, i))
+        }
+        TraceEntry {
+            timestamp: self.timestamp.as_ref().map(|a| a.value(i)).unwrap_or(0),
+            obj_id: self.obj_id.as_ref().map(|a| a.value(i)).unwrap_or(0),
+            obj_size: self.obj_size.as_ref().map(|a| a.value(i)).unwrap_or(0),
+            next_access_vtime: self
+                .next_access_vtime
+                .as_ref()
+                .map(|a| a.value(i))
+                .unwrap_or(-1),
+            op: nullable(&self.op, i, |a, i| a.value(i)),
+            ttl: nullable(&self.ttl, i, |a, i| a.value(i)),
+        }
+    }
 }
 
 impl TraceReader {
     /// Open a Parquet trace file.
+    ///
+    /// Reads the footer only; row groups are decoded on demand as the
+    /// iterator advances.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let file = File::open(path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-        let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let total_entries = usize::try_from(builder.metadata().file_metadata().num_rows())
+            .map_err(|_| Error::InvalidFormat("negative row count in footer".into()))?;
+        let batches = builder.with_batch_size(READ_BATCH_SIZE).build()?;
         Ok(Self {
             batches,
-            batch_idx: 0,
+            total_entries,
+            current: None,
             row_idx: 0,
+            failed: false,
         })
     }
 
-    /// Total number of entries across all row groups.
+    /// Total number of entries in the file, from the Parquet footer.
     pub fn total_entries(&self) -> usize {
-        self.batches.iter().map(|b| b.num_rows()).sum()
+        self.total_entries
+    }
+
+    /// Advance to the next non-empty batch. `Ok(false)` at end of file.
+    fn next_batch(&mut self) -> Result<bool, Error> {
+        loop {
+            match self.batches.next() {
+                Some(Ok(batch)) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.current = Some(Columns::from_batch(&batch));
+                    self.row_idx = 0;
+                    return Ok(true);
+                }
+                Some(Err(e)) => return Err(e.into()),
+                None => {
+                    self.current = None;
+                    return Ok(false);
+                }
+            }
+        }
     }
 }
 
 impl Iterator for TraceReader {
-    type Item = TraceEntry;
+    type Item = Result<TraceEntry, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.batch_idx < self.batches.len() {
-            let batch = &self.batches[self.batch_idx];
-            if self.row_idx >= batch.num_rows() {
-                self.batch_idx += 1;
-                self.row_idx = 0;
-                continue;
-            }
-
-            let i = self.row_idx;
-            self.row_idx += 1;
-
-            let timestamp = col_ts_ns(batch, "timestamp")
-                .map(|a| a.value(i))
-                .unwrap_or(0);
-            let obj_id = col_u64(batch, "obj_id").map(|a| a.value(i)).unwrap_or(0);
-            let obj_size = col_u32(batch, "obj_size").map(|a| a.value(i)).unwrap_or(0);
-            let next_access_vtime = col_i64(batch, "next_access_vtime")
-                .map(|a| a.value(i))
-                .unwrap_or(-1);
-            let op =
-                col_u8(batch, "op").and_then(
-                    |a| {
-                        if a.is_null(i) {
-                            None
-                        } else {
-                            Some(a.value(i))
-                        }
-                    },
-                );
-            let ttl =
-                col_i32(batch, "ttl").and_then(
-                    |a| {
-                        if a.is_null(i) {
-                            None
-                        } else {
-                            Some(a.value(i))
-                        }
-                    },
-                );
-
-            return Some(TraceEntry {
-                timestamp,
-                obj_id,
-                obj_size,
-                next_access_vtime,
-                op,
-                ttl,
-            });
+        if self.failed {
+            return None;
         }
-        None
+        let exhausted = match &self.current {
+            Some(cols) => self.row_idx >= cols.len,
+            None => true,
+        };
+        if exhausted {
+            match self.next_batch() {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        let cols = self.current.as_ref()?;
+        let i = self.row_idx;
+        self.row_idx += 1;
+        Some(Ok(cols.entry(i)))
     }
 }
-
-// Column downcast helpers
-fn col_ts_ns<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a TimestampNanosecondArray> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref())
-}
-fn col_u8<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt8Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref())
-}
-fn col_u32<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt32Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref())
-}
-fn col_u64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt64Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref())
-}
-fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref())
-}
-fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref())
-}
-
 // ---------------------------------------------------------------------------
 // Parquet writer
 // ---------------------------------------------------------------------------
@@ -657,7 +690,7 @@ mod tests {
         // Read back and verify values
         let reader = TraceReader::open(&path).unwrap();
         assert_eq!(reader.total_entries(), 3);
-        let read_entries: Vec<TraceEntry> = reader.collect();
+        let read_entries: Vec<TraceEntry> = reader.collect::<Result<_, _>>().unwrap();
 
         for (orig, read) in entries.iter().zip(read_entries.iter()) {
             assert_eq!(orig.timestamp, read.timestamp);
@@ -741,13 +774,64 @@ mod tests {
         assert_eq!(count, 3);
 
         let reader = TraceReader::open(&pq_path).unwrap();
-        let entries: Vec<TraceEntry> = reader.collect();
+        let entries: Vec<TraceEntry> = reader.collect::<Result<_, _>>().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].timestamp, 0); // 0 seconds → 0 nanoseconds
         assert_eq!(entries[0].obj_id, 1000);
         assert_eq!(entries[0].obj_size, 256);
         assert_eq!(entries[1].obj_id, 2000);
         assert_eq!(entries[2].next_access_vtime, -1);
+    }
+
+    /// A file with many row groups must stream through in order, with the
+    /// footer's row count available before the first row is decoded.
+    #[test]
+    fn reader_streams_across_row_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.parquet");
+
+        // Force small row groups so the file has many of them.
+        const ROWS: usize = 10_000;
+        const ROW_GROUP: usize = 512;
+        let schema = Arc::new(trace_schema());
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(ROW_GROUP))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), Some(props))
+                .unwrap();
+        let ids: Vec<u64> = (0..ROWS as u64).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    TimestampNanosecondArray::from(
+                        ids.iter().map(|&i| i as i64).collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(UInt64Array::from(ids.clone())),
+                Arc::new(UInt32Array::from(vec![1u32; ROWS])),
+                Arc::new(Int64Array::from(vec![-1i64; ROWS])),
+                Arc::new(UInt8Array::from(vec![None::<u8>; ROWS])),
+                Arc::new(Int32Array::from(vec![None::<i32>; ROWS])),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = TraceReader::open(&path).unwrap();
+        assert_eq!(reader.total_entries(), ROWS);
+        let mut n = 0u64;
+        for entry in reader {
+            let entry = entry.unwrap();
+            assert_eq!(entry.obj_id, n, "rows must arrive in file order");
+            assert_eq!(entry.timestamp, n as i64);
+            assert_eq!(entry.op, None);
+            n += 1;
+        }
+        assert_eq!(n as usize, ROWS);
     }
 
     #[test]
@@ -823,7 +907,7 @@ mod tests {
         assert_eq!(count, 3);
 
         let reader = TraceReader::open(&pq_path).unwrap();
-        let entries: Vec<TraceEntry> = reader.collect();
+        let entries: Vec<TraceEntry> = reader.collect::<Result<_, _>>().unwrap();
         assert_eq!(entries.len(), 3);
 
         // First and third entries share the same key → same obj_id

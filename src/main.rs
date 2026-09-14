@@ -332,6 +332,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut unique_ids = HashSet::new();
 
             for entry in reader {
+                let entry = entry?;
                 min_ts = min_ts.min(entry.timestamp);
                 max_ts = max_ts.max(entry.timestamp);
                 min_size = min_size.min(entry.obj_size);
