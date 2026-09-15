@@ -16,11 +16,11 @@ path = "src/lib.rs"
 
 [dependencies]
 ahash = "0.8"
-arrow = { version = "54", default-features = false, features = ["prettyprint"] }
+arrow = { version = "58", default-features = false, features = ["prettyprint"] }
 clap = { version = "4", features = ["derive"] }
-parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
-cuckoo-cache = { git = "https://github.com/pelikan-io/cache-rs", default-features = false }
-segcache = { version = "0.2.0", default-features = false }
+parquet = { version = "58", default-features = false, features = ["arrow", "zstd"] }
+cuckoo-cache = { version = "0.2.0", default-features = false }
+segcache = { version = "0.4.4", default-features = false }
 thiserror = "2"
 zstd = "0.13"
 
