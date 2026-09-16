@@ -1,12 +1,13 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use cachesim::annotate::annotate_next_access;
 use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{
-    simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig,
+    simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig, SimResult,
 };
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
@@ -46,6 +47,12 @@ enum Command {
         format: InputFormatArg,
     },
 
+    /// Sweep cache sizes and print the miss-ratio curve.
+    ///
+    /// Runs one full simulation per size, sequentially, so peak memory is one
+    /// cache rather than all of them.
+    Mrc(MrcCmd),
+
     /// Fill in `next_access_vtime` from the request sequence.
     ///
     /// Required before running the oracle engine on a trace converted from
@@ -77,6 +84,25 @@ struct SimulateCmd {
     /// Cache size (supports K/M/G suffixes, e.g. "64M").
     #[arg(short, long, default_value = "64M")]
     cache_size: String,
+
+    /// Cache engine and its policy.
+    #[command(subcommand)]
+    engine: Engine,
+}
+
+#[derive(Args)]
+struct MrcCmd {
+    /// Path to the trace file (Parquet format).
+    #[arg(short, long)]
+    trace: PathBuf,
+
+    /// Comma-separated cache sizes with K/M/G suffixes, e.g. "64M,128M,256M,1G".
+    #[arg(short, long)]
+    sizes: String,
+
+    /// Also write the curve as CSV to this path.
+    #[arg(long)]
+    csv: Option<PathBuf>,
 
     /// Cache engine and its policy.
     #[command(subcommand)]
@@ -233,6 +259,96 @@ fn parse_size(s: &str) -> Result<usize, String> {
         .map_err(|e| format!("invalid size '{s}': {e}"))
 }
 
+/// Run one simulation of `engine` at `cache_size` bytes over `trace`.
+///
+/// Shared by `simulate` (one size) and `mrc` (a sweep). `verbose` prints the
+/// resolved engine configuration to stderr first.
+fn run_engine(
+    trace: &Path,
+    cache_size: usize,
+    engine: &Engine,
+    verbose: bool,
+) -> Result<SimResult, cachesim::Error> {
+    match engine {
+        Engine::Segcache {
+            policy,
+            segment_size,
+            hash_power,
+            default_ttl,
+            max_obj_size,
+            admission_ratio,
+        } => {
+            let config = SimConfig {
+                cache_size,
+                segment_size: *segment_size,
+                hash_power: *hash_power,
+                eviction: policy.clone().into_policy(*admission_ratio),
+                default_ttl: *default_ttl,
+                max_obj_size: *max_obj_size,
+            };
+            if verbose {
+                eprintln!("Running segcache simulation …");
+                eprintln!("  cache size:    {} bytes", config.cache_size);
+                eprintln!("  segment size:  {} bytes", config.segment_size);
+                eprintln!("  hash power:    {}", config.hash_power);
+                eprintln!("  eviction:      {:?}", config.eviction);
+            }
+            simulate_segcache(trace, &config)
+        }
+
+        Engine::Cuckoo {
+            policy,
+            item_size,
+            max_displace,
+            max_ttl,
+            default_ttl,
+            max_obj_size,
+        } => {
+            let config = CuckooConfig {
+                nitem: cache_size / item_size,
+                item_size: *item_size,
+                max_displace: *max_displace,
+                eviction: policy.clone().into(),
+                default_ttl: *default_ttl,
+                max_ttl: *max_ttl,
+                max_obj_size: *max_obj_size,
+            };
+            if verbose {
+                eprintln!("Running cuckoo-cache simulation …");
+                eprintln!("  cache size:      {cache_size} bytes");
+                eprintln!("  item size:       {} bytes", config.item_size);
+                eprintln!("  nitem:           {}", config.nitem);
+                eprintln!("  max displace:    {}", config.max_displace);
+                eprintln!("  eviction:        {:?}", config.eviction);
+            }
+            simulate_cuckoo(trace, &config)
+        }
+
+        Engine::Oracle { policy } => {
+            let oracle_policy: OraclePolicy = policy.clone().into();
+            if verbose {
+                eprintln!("Running oracle simulation …");
+                eprintln!("  cache size:    {cache_size} bytes");
+                eprintln!("  eviction:      {oracle_policy:?}");
+            }
+            simulate_oracle(trace, cache_size, oracle_policy)
+        }
+    }
+}
+
+/// Parse a comma-separated list of sizes (`64M,128M,1G`), each as `parse_size`.
+fn parse_sizes(s: &str) -> Result<Vec<usize>, String> {
+    let sizes: Vec<usize> = s
+        .split(',')
+        .filter(|p| !p.trim().is_empty())
+        .map(parse_size)
+        .collect::<Result<_, _>>()?;
+    if sizes.is_empty() {
+        return Err("no sizes given".into());
+    }
+    Ok(sizes)
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -244,75 +360,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Simulate(sim) => {
             let cache_size =
                 parse_size(&sim.cache_size).map_err(|e| format!("bad --cache-size: {e}"))?;
+            let result = run_engine(&sim.trace, cache_size, &sim.engine, true)?;
+            println!("{result}");
+        }
 
-            let result = match sim.engine {
-                Engine::Segcache {
-                    policy,
-                    segment_size,
-                    hash_power,
-                    default_ttl,
-                    max_obj_size,
-                    admission_ratio,
-                } => {
-                    let config = SimConfig {
-                        cache_size,
-                        segment_size,
-                        hash_power,
-                        eviction: policy.into_policy(admission_ratio),
-                        default_ttl,
-                        max_obj_size,
-                    };
-
-                    eprintln!("Running segcache simulation …");
-                    eprintln!("  cache size:    {} bytes", config.cache_size);
-                    eprintln!("  segment size:  {} bytes", config.segment_size);
-                    eprintln!("  hash power:    {}", config.hash_power);
-                    eprintln!("  eviction:      {:?}", config.eviction);
-
-                    simulate_segcache(&sim.trace, &config)?
+        Command::Mrc(mrc) => {
+            let sizes = parse_sizes(&mrc.sizes).map_err(|e| format!("bad --sizes: {e}"))?;
+            let mut csv = match &mrc.csv {
+                Some(path) => {
+                    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+                    writeln!(
+                        f,
+                        "cache_size,hit_rate,miss_rate,requests,hits,misses,inserts,insert_failures,deletes,skipped"
+                    )?;
+                    Some(f)
                 }
-
-                Engine::Cuckoo {
-                    policy,
-                    item_size,
-                    max_displace,
-                    max_ttl,
-                    default_ttl,
-                    max_obj_size,
-                } => {
-                    let nitem = cache_size / item_size;
-                    let config = CuckooConfig {
-                        nitem,
-                        item_size,
-                        max_displace,
-                        eviction: policy.into(),
-                        default_ttl,
-                        max_ttl,
-                        max_obj_size,
-                    };
-
-                    eprintln!("Running cuckoo-cache simulation …");
-                    eprintln!("  cache size:      {} bytes", cache_size);
-                    eprintln!("  item size:       {} bytes", config.item_size);
-                    eprintln!("  nitem:           {}", config.nitem);
-                    eprintln!("  max displace:    {}", config.max_displace);
-                    eprintln!("  eviction:        {:?}", config.eviction);
-
-                    simulate_cuckoo(&sim.trace, &config)?
-                }
-
-                Engine::Oracle { policy } => {
-                    let oracle_policy: OraclePolicy = policy.into();
-
-                    eprintln!("Running oracle simulation …");
-                    eprintln!("  cache size:    {cache_size} bytes");
-                    eprintln!("  eviction:      {oracle_policy:?}");
-
-                    simulate_oracle(&sim.trace, cache_size, oracle_policy)?
-                }
+                None => None,
             };
 
-            println!("{result}");
+            println!(
+                "{:>14} {:>9} {:>9} {:>14} {:>14} {:>15}",
+                "cache_size", "hit_rate", "miss_rate", "hits", "misses", "insert_failures"
+            );
+            for &cache_size in &sizes {
+                eprintln!("mrc: {cache_size} bytes …");
+                let r = run_engine(&mrc.trace, cache_size, &mrc.engine, false)?;
+                println!(
+                    "{:>14} {:>8.4}% {:>8.4}% {:>14} {:>14} {:>15}",
+                    cache_size,
+                    r.hit_rate() * 100.0,
+                    r.miss_rate() * 100.0,
+                    r.hits,
+                    r.misses,
+                    r.insert_failures
+                );
+                if let Some(f) = csv.as_mut() {
+                    writeln!(
+                        f,
+                        "{},{:.6},{:.6},{},{},{},{},{},{},{}",
+                        cache_size,
+                        r.hit_rate(),
+                        r.miss_rate(),
+                        r.total_requests,
+                        r.hits,
+                        r.misses,
+                        r.inserts,
+                        r.insert_failures,
+                        r.deletes,
+                        r.skipped
+                    )?;
+                }
+            }
+            if let Some(mut f) = csv {
+                f.flush()?;
+            }
         }
 
         Command::Convert {

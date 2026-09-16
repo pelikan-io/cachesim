@@ -209,6 +209,7 @@ Three subcommands:
 | `simulate`  | Replay a Parquet trace against segcache, cuckoo, or oracle   |
 | `convert`   | Import a trace to Parquet (binary or CSV)                    |
 | `annotate`  | Compute `next_access_vtime` for a trace that lacks it        |
+| `mrc`       | Sweep cache sizes and print the miss-ratio curve             |
 | `info`      | Print summary statistics for a Parquet trace file            |
 
 ## Usage
@@ -244,7 +245,28 @@ cachesim simulate -t trace.parquet -c 64M oracle -p belady-size
 
 # Inspect a trace
 cachesim info -t trace.parquet
+
+# Miss-ratio curve: one full simulation per size, table to stdout and
+# optionally CSV. Takes the same engine subcommands as `simulate`.
+cachesim mrc -t trace.parquet -s 64M,128M,256M,512M,1G --csv mrc.csv segcache -p fifo
+cachesim mrc -t trace.parquet -s 64M,128M,256M,512M,1G oracle -p belady
 ```
+
+### MRC options
+
+```
+-t, --trace <PATH>         Parquet trace file (required)
+-s, --sizes <LIST>         Comma-separated sizes with K/M/G suffixes (required)
+    --csv <PATH>           Also write the curve as CSV
+```
+
+Sizes run sequentially, so peak memory is one cache plus the streaming
+reader, not the sum of the sweep. Watch the `insert_failures` column: a curve
+that goes flat while failures climb is a cache that ran out of hash-table
+slots, not one that ran out of bytes, and needs a larger `--hash-power`
+(segcache) or `--item-size` budget (cuckoo) before the numbers mean anything. The CSV columns are `cache_size, hit_rate,
+miss_rate, requests, hits, misses, inserts, insert_failures, deletes,
+skipped`; rates are fractions in `[0, 1]`.
 
 ### Simulate options
 
