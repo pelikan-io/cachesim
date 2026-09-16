@@ -127,7 +127,7 @@ Field mapping during import:
 | `client_id`   | —                    | not stored                                  |
 | `operation`   | `op`                 | string -> `req_op_e` integer                |
 | `ttl`         | `ttl`                | 0 -> null, >0 -> Some                       |
-| —             | `next_access_vtime`  | set to `-1` (not available in CSV)          |
+| —             | `next_access_vtime`  | set to `-1`; run `cachesim annotate` to fill it |
 
 ## Code Architecture
 
@@ -154,6 +154,14 @@ src/
   pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
 - **`Op`** — operation enum matching `req_op_e`, with `is_read()` /
   `is_write()` / `is_delete()` classification helpers.
+
+### `annotate` module
+
+- **`annotate_next_access()`** — two-pass rewrite that fills
+  `next_access_vtime` from the request sequence. A backward pass over row
+  groups reads only `obj_id` and spills each row's answer to a temp file; a
+  forward pass streams the trace and splices the answers in. Peak memory is
+  one row group plus a map of unique objects, independent of trace length.
 
 ### `oracle` module
 
@@ -200,6 +208,7 @@ Three subcommands:
 |-------------|--------------------------------------------------------------|
 | `simulate`  | Replay a Parquet trace against segcache, cuckoo, or oracle   |
 | `convert`   | Import a trace to Parquet (binary or CSV)                    |
+| `annotate`  | Compute `next_access_vtime` for a trace that lacks it        |
 | `info`      | Print summary statistics for a Parquet trace file            |
 
 ## Usage
@@ -210,6 +219,10 @@ cachesim convert -i trace.oracleGeneral.bin -o trace.parquet
 
 # Convert a pelikan-io/cache-trace CSV (zstd-compressed)
 cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
+
+# Fill in next_access_vtime (required before `simulate ... oracle` on a
+# CSV-converted trace; the oracle engine refuses a trace without it)
+cachesim annotate -i cluster001.parquet -o cluster001.oracle.parquet
 
 # Run a simulation (64 MB cache, FIFO eviction via segcache)
 cachesim simulate -t trace.parquet -c 64M segcache -p fifo
@@ -296,7 +309,9 @@ failures).
 | `belady-size` | Optimal (size-aware): evict max(distance × size) |
 
 Oracle policies use `next_access_vtime` from the trace and ignore
-segcache-specific options (segment size, hash power, TTL).
+segcache-specific options (segment size, hash power, TTL). A trace whose
+`next_access_vtime` is `-1` throughout (anything converted from CSV) is
+refused; run `cachesim annotate` on it first.
 
 ## Building
 

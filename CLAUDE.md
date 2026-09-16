@@ -24,9 +24,10 @@ CI runs on ubuntu, macos, and windows. All four checks (lint, 3x build-and-test)
 ```
 src/lib.rs          Policy enums (SegcachePolicy, CuckooPolicy), Error type
 src/trace.rs        TraceEntry, TraceReader/Writer, Parquet I/O, format converters
+src/annotate.rs     annotate_next_access(): two-pass next_access_vtime fill
 src/oracle.rs       OracleCache with Belady/BeladySize policies
 src/simulator.rs    SimConfig/CuckooConfig, simulate_segcache()/simulate_cuckoo()/simulate_oracle(), SimResult
-src/main.rs         CLI (clap): simulate, convert, info subcommands
+src/main.rs         CLI (clap): simulate, convert, annotate, info subcommands
 ```
 
 ## Architecture

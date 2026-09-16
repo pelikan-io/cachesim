@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use cachesim::annotate::annotate_next_access;
 use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{
     simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig,
@@ -43,6 +44,20 @@ enum Command {
         /// Format of the input file.
         #[arg(short, long, default_value = "oracle-general")]
         format: InputFormatArg,
+    },
+
+    /// Fill in `next_access_vtime` from the request sequence.
+    ///
+    /// Required before running the oracle engine on a trace converted from
+    /// CSV or captured live: those carry -1 in every row.
+    Annotate {
+        /// Input Parquet trace.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output Parquet trace (all columns copied, `next_access_vtime` set).
+        #[arg(short, long)]
+        output: PathBuf,
     },
 
     /// Print statistics about a Parquet trace file.
@@ -320,6 +335,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Converted {count} entries → {}", output.display());
         }
 
+        Command::Annotate { input, output } => {
+            eprintln!("Annotating next_access_vtime …");
+            let stats = annotate_next_access(&input, &output, 65_536)?;
+            eprintln!(
+                "Annotated {} rows ({} unique objects, {} rows reused later) → {}",
+                stats.rows,
+                stats.unique_objects,
+                stats.reused_rows,
+                output.display()
+            );
+        }
+
         Command::Info { trace } => {
             let reader = TraceReader::open(&trace)?;
             let total = reader.total_entries();
@@ -330,9 +357,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut max_size = 0u32;
             let mut total_size: u64 = 0;
             let mut unique_ids = HashSet::new();
+            let mut annotated: u64 = 0;
 
             for entry in reader {
                 let entry = entry?;
+                if entry.next_access_vtime >= 0 {
+                    annotated += 1;
+                }
                 min_ts = min_ts.min(entry.timestamp);
                 max_ts = max_ts.max(entry.timestamp);
                 min_size = min_size.min(entry.obj_size);
@@ -354,6 +385,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     total_size as f64 / total as f64
                 );
                 println!("  total footprint: {total_size} bytes");
+                println!(
+                    "  next-access:     {annotated} rows annotated{}",
+                    if annotated == 0 {
+                        " (run `cachesim annotate` before the oracle engine)"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
     }
