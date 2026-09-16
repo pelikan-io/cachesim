@@ -376,6 +376,8 @@ mod tests {
                 next_access_vtime: if i == 0 { 1 } else { -1 },
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             })
             .collect();
 
@@ -404,6 +406,8 @@ mod tests {
             next_access_vtime: -1,
             op: None,
             ttl: None,
+            key_size: None,
+            value_size: None,
         }];
 
         let (_dir, path) = write_synthetic_trace(&entries);
@@ -423,6 +427,8 @@ mod tests {
                 next_access_vtime: 1,
                 op: Some(Op::Get as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 1,
@@ -431,6 +437,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: Some(Op::Delete as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
         ];
 
@@ -458,6 +466,8 @@ mod tests {
                 next_access_vtime: 1,
                 op: Some(Op::Set as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 1,
@@ -466,6 +476,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: Some(Op::Get as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
         ];
 
@@ -497,6 +509,8 @@ mod tests {
                 next_access_vtime: if i == 0 { 1 } else { -1 },
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             })
             .collect();
 
@@ -524,6 +538,8 @@ mod tests {
             next_access_vtime: -1,
             op: None,
             ttl: None,
+            key_size: None,
+            value_size: None,
         }];
 
         let (_dir, path) = write_synthetic_trace(&entries);
@@ -543,6 +559,8 @@ mod tests {
                 next_access_vtime: 1,
                 op: Some(Op::Get as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 1,
@@ -551,6 +569,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: Some(Op::Delete as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
         ];
 
@@ -577,6 +597,8 @@ mod tests {
                 next_access_vtime: 1,
                 op: Some(Op::Set as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 1,
@@ -585,6 +607,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: Some(Op::Get as u8),
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
         ];
 
@@ -623,6 +647,8 @@ mod tests {
                 next_access_vtime: 4, // far
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 0,
@@ -631,6 +657,8 @@ mod tests {
                 next_access_vtime: 3, // sooner
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 0,
@@ -639,6 +667,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 0,
@@ -647,6 +677,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
         ];
 

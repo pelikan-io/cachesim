@@ -34,12 +34,18 @@ Each row in a trace file represents a single cache request:
 | `next_access_vtime`| `Int64`    | no       | Virtual time of the next access (`-1` = no reuse)  |
 | `op`               | `UInt8`    | yes      | Operation type (see below)                         |
 | `ttl`              | `Int32`    | yes      | Time-to-live in seconds                            |
+| `key_size`         | `UInt32`   | yes      | Key component of `obj_size`, when known separately |
+| `value_size`       | `UInt32`   | yes      | Value component of `obj_size`, when known separately |
 
 Parquet files are compressed with ZSTD by default.
 
 The first four columns correspond directly to libCacheSim's **oracleGeneral**
 binary format. `op` and `ttl` are extension columns that support richer trace
-data (e.g. the **oracleGeneralOpNs** format).
+data (e.g. the **oracleGeneralOpNs** format). `key_size` and `value_size`
+carry the two components of `obj_size` when the source records them
+separately; a replay tool needs the value length on its own, since it renders
+key bytes itself. Files written without the extension columns still read, with
+the missing fields reported as absent.
 
 ### Operation Types
 
@@ -116,8 +122,8 @@ Field mapping during import:
 |---------------|----------------------|---------------------------------------------|
 | `timestamp`   | `timestamp`          | seconds -> nanoseconds (`* 1_000_000_000`)  |
 | `key`         | `obj_id`             | deterministic hash (ahash, fixed seed)      |
-| `key_size`    | `obj_size` (partial) | `key_size + value_size`                     |
-| `value_size`  | `obj_size` (partial) | `key_size + value_size`                     |
+| `key_size`    | `key_size`, `obj_size` | stored as-is; `obj_size = key_size + value_size` |
+| `value_size`  | `value_size`, `obj_size` | stored as-is; `obj_size = key_size + value_size` |
 | `client_id`   | —                    | not stored                                  |
 | `operation`   | `op`                 | string -> `req_op_e` integer                |
 | `ttl`         | `ttl`                | 0 -> null, >0 -> Some                       |

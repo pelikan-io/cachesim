@@ -10,8 +10,10 @@
 //! | obj_size           | u32    | 4     | Object size in bytes               |
 //! | next_access_vtime  | i64    | 8     | Virtual time of next access        |
 //!
-//! Two optional extension columns (`op`, `ttl`) support the richer
-//! `oracleGeneralOpNs` format and workloads with mixed operations.
+//! Optional extension columns support richer sources: `op` and `ttl` for the
+//! `oracleGeneralOpNs` format and workloads with mixed operations, and
+//! `key_size` / `value_size` for sources that record the two components of
+//! `obj_size` separately.
 //!
 //! In addition to libCacheSim binary formats, this module can import
 //! [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV
@@ -133,6 +135,16 @@ pub struct TraceEntry {
     pub op: Option<u8>,
     /// Time-to-live in seconds (extended field).
     pub ttl: Option<i32>,
+    /// Key size in bytes, when the source records it separately from the
+    /// value. `obj_size` is always the total; this is its key component.
+    pub key_size: Option<u32>,
+    /// Value size in bytes, when the source records it separately from the
+    /// key. `obj_size` is always the total; this is its value component.
+    ///
+    /// A replay tool needs this rather than `obj_size`: the key bytes are
+    /// something it renders itself, while the value length is what it has
+    /// to put on the wire and what drives memory pressure on the server.
+    pub value_size: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +164,8 @@ pub fn trace_schema() -> Schema {
         Field::new("next_access_vtime", DataType::Int64, false),
         Field::new("op", DataType::UInt8, true),
         Field::new("ttl", DataType::Int32, true),
+        Field::new("key_size", DataType::UInt32, true),
+        Field::new("value_size", DataType::UInt32, true),
     ])
 }
 
@@ -190,6 +204,8 @@ struct Columns {
     next_access_vtime: Option<Int64Array>,
     op: Option<UInt8Array>,
     ttl: Option<Int32Array>,
+    key_size: Option<UInt32Array>,
+    value_size: Option<UInt32Array>,
 }
 
 impl Columns {
@@ -208,6 +224,8 @@ impl Columns {
             next_access_vtime: col(batch, "next_access_vtime"),
             op: col(batch, "op"),
             ttl: col(batch, "ttl"),
+            key_size: col(batch, "key_size"),
+            value_size: col(batch, "value_size"),
         }
     }
 
@@ -229,6 +247,8 @@ impl Columns {
                 .unwrap_or(-1),
             op: nullable(&self.op, i, |a, i| a.value(i)),
             ttl: nullable(&self.ttl, i, |a, i| a.value(i)),
+            key_size: nullable(&self.key_size, i, |a, i| a.value(i)),
+            value_size: nullable(&self.value_size, i, |a, i| a.value(i)),
         }
     }
 }
@@ -322,6 +342,8 @@ pub struct TraceWriter {
     next_access_vtimes: Vec<i64>,
     ops: Vec<Option<u8>>,
     ttls: Vec<Option<i32>>,
+    key_sizes: Vec<Option<u32>>,
+    value_sizes: Vec<Option<u32>>,
     batch_size: usize,
 }
 
@@ -344,6 +366,8 @@ impl TraceWriter {
             next_access_vtimes: Vec::with_capacity(batch_size),
             ops: Vec::with_capacity(batch_size),
             ttls: Vec::with_capacity(batch_size),
+            key_sizes: Vec::with_capacity(batch_size),
+            value_sizes: Vec::with_capacity(batch_size),
             batch_size,
         })
     }
@@ -356,6 +380,8 @@ impl TraceWriter {
         self.next_access_vtimes.push(entry.next_access_vtime);
         self.ops.push(entry.op);
         self.ttls.push(entry.ttl);
+        self.key_sizes.push(entry.key_size);
+        self.value_sizes.push(entry.value_size);
 
         if self.timestamps.len() >= self.batch_size {
             self.flush_batch()?;
@@ -380,6 +406,8 @@ impl TraceWriter {
             ))),
             Arc::new(UInt8Array::from(std::mem::take(&mut self.ops))),
             Arc::new(Int32Array::from(std::mem::take(&mut self.ttls))),
+            Arc::new(UInt32Array::from(std::mem::take(&mut self.key_sizes))),
+            Arc::new(UInt32Array::from(std::mem::take(&mut self.value_sizes))),
         ];
 
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
@@ -468,6 +496,8 @@ fn parse_oracle_general(buf: &[u8]) -> TraceEntry {
         next_access_vtime: i64::from_le_bytes(buf[16..24].try_into().unwrap()),
         op: None,
         ttl: None,
+        key_size: None,
+        value_size: None,
     }
 }
 
@@ -483,6 +513,8 @@ fn parse_oracle_general_opns(buf: &[u8]) -> TraceEntry {
         // bytes 17..19 = u16 namespace (not stored as a separate column)
         next_access_vtime: i64::from_le_bytes(buf[19..27].try_into().unwrap()),
         ttl: None,
+        key_size: None,
+        value_size: None,
     }
 }
 
@@ -497,7 +529,8 @@ fn parse_oracle_general_opns(buf: &[u8]) -> TraceEntry {
 ///
 /// * `timestamp` (seconds) is widened to u64 nanoseconds.
 /// * `key` is hashed to a deterministic `u64` via ahash (fixed seed).
-/// * `obj_size` = `key_size + value_size`.
+/// * `obj_size` = `key_size + value_size`; the two components are also kept
+///   in the `key_size` / `value_size` columns.
 /// * `next_access_vtime` is set to `-1` (not available in CSV).
 /// * Files with a `.zst` extension are decompressed automatically.
 ///
@@ -591,6 +624,8 @@ fn parse_cache_trace_line(
         next_access_vtime: -1,
         op: Some(op as u8),
         ttl: if ttl > 0 { Some(ttl) } else { None },
+        key_size: Some(key_size),
+        value_size: Some(value_size),
     })
 }
 
@@ -661,6 +696,8 @@ mod tests {
                 next_access_vtime: 3,
                 op: Some(1),
                 ttl: Some(300),
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 2,
@@ -669,6 +706,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
             TraceEntry {
                 timestamp: 3,
@@ -677,6 +716,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: Some(9), // DELETE
                 ttl: None,
+                key_size: None,
+                value_size: None,
             },
         ];
 
@@ -716,6 +757,8 @@ mod tests {
                 next_access_vtime: -1,
                 op: None,
                 ttl: None,
+                key_size: None,
+                value_size: None,
             })
             .unwrap();
         writer.finish().unwrap();
@@ -739,7 +782,9 @@ mod tests {
                 "obj_size",
                 "next_access_vtime",
                 "op",
-                "ttl"
+                "ttl",
+                "key_size",
+                "value_size"
             ]
         );
 
@@ -815,6 +860,8 @@ mod tests {
                 Arc::new(Int64Array::from(vec![-1i64; ROWS])),
                 Arc::new(UInt8Array::from(vec![None::<u8>; ROWS])),
                 Arc::new(Int32Array::from(vec![None::<i32>; ROWS])),
+                Arc::new(UInt32Array::from(vec![None::<u32>; ROWS])),
+                Arc::new(UInt32Array::from(vec![None::<u32>; ROWS])),
             ],
         )
         .unwrap();
@@ -832,6 +879,56 @@ mod tests {
             n += 1;
         }
         assert_eq!(n as usize, ROWS);
+    }
+
+    /// Files written before `key_size` / `value_size` existed must still
+    /// read, with the two new fields absent rather than the open failing on
+    /// a missing column.
+    #[test]
+    fn reader_tolerates_files_without_size_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.parquet");
+
+        let legacy_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                false,
+            ),
+            Field::new("obj_id", DataType::UInt64, false),
+            Field::new("obj_size", DataType::UInt32, false),
+            Field::new("next_access_vtime", DataType::Int64, false),
+            Field::new("op", DataType::UInt8, true),
+            Field::new("ttl", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            legacy_schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![7i64]).with_timezone("UTC")),
+                Arc::new(UInt64Array::from(vec![42u64])),
+                Arc::new(UInt32Array::from(vec![300u32])),
+                Arc::new(Int64Array::from(vec![-1i64])),
+                Arc::new(UInt8Array::from(vec![Some(Op::Set as u8)])),
+                Arc::new(Int32Array::from(vec![Some(60i32)])),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), legacy_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let entries: Vec<TraceEntry> = TraceReader::open(&path)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].obj_id, 42);
+        assert_eq!(entries[0].obj_size, 300);
+        assert_eq!(entries[0].op, Some(Op::Set as u8));
+        assert_eq!(entries[0].ttl, Some(60));
+        assert_eq!(entries[0].key_size, None);
+        assert_eq!(entries[0].value_size, None);
     }
 
     #[test]
@@ -860,6 +957,8 @@ mod tests {
 
         assert_eq!(entry.timestamp, 1_583_990_400 * NANOS_PER_SEC);
         assert_eq!(entry.obj_size, 22 + 304);
+        assert_eq!(entry.key_size, Some(22));
+        assert_eq!(entry.value_size, Some(304));
         assert_eq!(entry.op, Some(Op::Get as u8));
         assert_eq!(entry.ttl, None); // ttl=0 → None
         assert_eq!(entry.next_access_vtime, -1);
@@ -918,6 +1017,8 @@ mod tests {
         assert_eq!(entries[0].op, Some(Op::Get as u8));
         assert_eq!(entries[1].op, Some(Op::Set as u8));
         assert_eq!(entries[1].ttl, Some(7200));
+        assert_eq!(entries[1].key_size, Some(15));
+        assert_eq!(entries[1].value_size, Some(500));
         assert_eq!(entries[2].op, Some(Op::Delete as u8));
     }
 }
