@@ -34,7 +34,9 @@ fn valid_segment(s: &str) -> bool {
 }
 
 /// Check a repository id (`name` or `org/name`) and revision, since both
-/// become URL and cache-path components.
+/// become URL and cache-path components. The revision is a single name (a
+/// branch, tag or commit hash); `refs/pr/N` and names containing `/` are
+/// rejected.
 pub fn validate(repo_id: &str, revision: &str) -> Result<(), Error> {
     let parts: Vec<&str> = repo_id.split('/').collect();
     if parts.len() > 2 || !parts.iter().all(|p| valid_segment(p)) {

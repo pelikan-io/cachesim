@@ -69,9 +69,10 @@ struct MooncakeArgs {
     #[arg(long, value_name = "REPO_ID", conflicts_with_all = ["model_config", "kv_bytes_per_token", "model_name"])]
     model: Option<String>,
 
-    /// Branch, tag or commit of --model.
-    #[arg(long, default_value = "main", requires = "model")]
-    revision: String,
+    /// Branch, tag or commit of --model [default: main]. A single name:
+    /// refs/pr/N and names containing '/' are not accepted.
+    #[arg(long, value_name = "REV", requires = "model")]
+    revision: Option<String>,
 
     /// Local Hugging Face config.json of the model; sizes are derived from it.
     #[arg(long, value_name = "PATH", conflicts_with = "kv_bytes_per_token")]
@@ -93,22 +94,26 @@ struct MooncakeArgs {
     #[arg(long, value_name = "NAME")]
     model_name: Option<String>,
 
-    /// Tokens per object; must divide the 512-token source block.
-    #[arg(long, default_value_t = 256)]
-    chunk_tokens: u64,
+    // The options below have no clap defaults so that main() can tell whether
+    // they were given with another format; options() applies the defaults.
+    /// Tokens per object; must divide the 512-token source block [default: 256].
+    #[arg(long, value_name = "N")]
+    chunk_tokens: Option<u64>,
 
     /// Tensor-parallel degree: one object per rank, 1/N of the bytes (MLA
-    /// models: first rank only, full size).
-    #[arg(long, default_value_t = 1)]
-    tp: u64,
+    /// models: first rank only, full size) [default: 1].
+    #[arg(long, value_name = "N")]
+    tp: Option<u64>,
 
-    /// Hybrid models: when a recurrent-state snapshot is stored.
-    #[arg(long, default_value = "per-request")]
-    state_mode: StateModeArg,
+    /// Hybrid models: when a recurrent-state snapshot is stored
+    /// [default: per-request].
+    #[arg(long)]
+    state_mode: Option<StateModeArg>,
 
-    /// Hybrid models: state in the chunk's object or as its own object.
-    #[arg(long, default_value = "combined")]
-    state_layout: StateLayoutArg,
+    /// Hybrid models: state in the chunk's object or as its own object
+    /// [default: combined].
+    #[arg(long)]
+    state_layout: Option<StateLayoutArg>,
 }
 
 impl MooncakeArgs {
@@ -117,12 +122,13 @@ impl MooncakeArgs {
         let (sizes, config_sha256, model_name, model_revision) =
             match (&self.model, &self.model_config, self.kv_bytes_per_token) {
                 (Some(repo), None, None) => {
-                    let bytes = fetch_model_config(repo, &self.revision)?;
+                    let revision = self.revision.as_deref().unwrap_or("main");
+                    let bytes = fetch_model_config(repo, revision)?;
                     (
                         ModelSizes::from_config_bytes(&bytes, kv_dtype)?,
                         Some(sha256_hex(&bytes)),
                         Some(repo.clone()),
-                        Some(self.revision.clone()),
+                        Some(revision.to_string()),
                     )
                 }
                 (None, Some(path), None) => {
@@ -153,17 +159,41 @@ impl MooncakeArgs {
             model_name,
             model_revision,
             model_config_sha256: config_sha256,
-            chunk_tokens: self.chunk_tokens,
-            tp: self.tp,
-            state_mode: self.state_mode.into(),
-            state_layout: self.state_layout.into(),
+            chunk_tokens: self.chunk_tokens.unwrap_or(256),
+            tp: self.tp.unwrap_or(1),
+            state_mode: self.state_mode.unwrap_or(StateModeArg::PerRequest).into(),
+            state_layout: self.state_layout.unwrap_or(StateLayoutArg::Combined).into(),
         })
     }
 
-    /// Whether any option that only applies to `-f mooncake` was given.
-    fn any_sizes_given(&self) -> bool {
-        self.model.is_some() || self.model_config.is_some() || self.kv_bytes_per_token.is_some()
+    /// The Mooncake options given on the command line.
+    fn given(&self) -> Vec<&'static str> {
+        [
+            ("--model", self.model.is_some()),
+            ("--revision", self.revision.is_some()),
+            ("--model-config", self.model_config.is_some()),
+            ("--kv-bytes-per-token", self.kv_bytes_per_token.is_some()),
+            ("--state-bytes", self.state_bytes.is_some()),
+            ("--kv-dtype", self.kv_dtype.is_some()),
+            ("--model-name", self.model_name.is_some()),
+            ("--chunk-tokens", self.chunk_tokens.is_some()),
+            ("--tp", self.tp.is_some()),
+            ("--state-mode", self.state_mode.is_some()),
+            ("--state-layout", self.state_layout.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, given)| given.then_some(flag))
+        .collect()
     }
+}
+
+/// Reject Mooncake options given with another input format.
+fn check_format_options(format: &InputFormatArg, mooncake: &MooncakeArgs) -> Result<(), String> {
+    let given = mooncake.given();
+    if matches!(format, InputFormatArg::Mooncake) || given.is_empty() {
+        return Ok(());
+    }
+    Err(format!("{} apply only to -f mooncake", given.join(", ")))
 }
 
 #[cfg(feature = "hf-fetch")]
@@ -467,12 +497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             format,
             mooncake,
         } => {
-            if !matches!(format, InputFormatArg::Mooncake) && mooncake.any_sizes_given() {
-                return Err(
-                    "--model, --model-config and --kv-bytes-per-token apply only to -f mooncake"
-                        .into(),
-                );
-            }
+            check_format_options(&format, &mooncake)?;
             eprintln!("Converting {:?} trace …", format);
             let count = match format {
                 InputFormatArg::OracleGeneral => {
@@ -543,4 +568,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(args: &[&str]) -> Result<(), String> {
+        let cli = Cli::try_parse_from(
+            ["cachesim", "convert", "-i", "in", "-o", "out"]
+                .iter()
+                .chain(args),
+        )
+        .map_err(|e| e.to_string())?;
+        match cli.command {
+            Command::Convert {
+                format, mooncake, ..
+            } => check_format_options(&format, &mooncake),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn mooncake_options_are_rejected_for_other_formats() {
+        for flags in [
+            &["--tp", "8"][..],
+            &["--chunk-tokens", "128"],
+            &["--state-mode", "per-chunk"],
+            &["--state-layout", "separate"],
+            &["--kv-dtype", "fp8"],
+            &["--model-name", "x"],
+            &["--kv-bytes-per-token", "10"],
+            &["--model-config", "c.json"],
+            &["--model", "Qwen/Qwen3-8B"],
+        ] {
+            let mut args = vec!["-f", "cache-trace"];
+            args.extend_from_slice(flags);
+            let err = check(&args).unwrap_err();
+            assert!(err.contains(flags[0]), "{flags:?}: {err}");
+        }
+        assert!(check(&["-f", "cache-trace"]).is_ok());
+        assert!(check(&[]).is_ok());
+        assert!(check(&["-f", "mooncake", "--kv-bytes-per-token", "10", "--tp", "8"]).is_ok());
+    }
+
+    #[test]
+    fn mooncake_defaults() {
+        let cli = Cli::try_parse_from([
+            "cachesim",
+            "convert",
+            "-i",
+            "in",
+            "-o",
+            "out",
+            "-f",
+            "mooncake",
+            "--kv-bytes-per-token",
+            "10",
+        ])
+        .unwrap();
+        let Command::Convert { mooncake, .. } = cli.command else {
+            unreachable!()
+        };
+        let opts = mooncake.options().unwrap();
+        assert_eq!(opts.chunk_tokens, 256);
+        assert_eq!(opts.tp, 1);
+        assert_eq!(opts.state_mode, StateMode::PerRequest);
+        assert_eq!(opts.state_layout, StateLayout::Combined);
+    }
 }
