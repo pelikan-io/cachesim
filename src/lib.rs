@@ -1,3 +1,6 @@
+#[cfg(feature = "hf-fetch")]
+pub mod hf;
+pub mod mooncake;
 pub mod oracle;
 pub mod simulator;
 pub mod trace;
@@ -89,4 +92,7 @@ pub enum Error {
 
     #[error("Invalid format: {0}")]
     InvalidFormat(String),
+
+    #[error("Fetch error: {0}")]
+    Fetch(String),
 }

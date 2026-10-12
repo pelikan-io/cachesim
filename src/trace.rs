@@ -32,6 +32,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 
 use crate::Error;
@@ -348,6 +349,13 @@ impl TraceWriter {
         })
     }
 
+    /// Add a key-value pair to the Parquet file footer. Pairs appended any
+    /// time before [`finish`](Self::finish) are written.
+    pub fn append_key_value_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.writer
+            .append_key_value_metadata(KeyValue::new(key.into(), value.into()));
+    }
+
     /// Append a single entry (buffered; flushed in batches).
     pub fn write(&mut self, entry: &TraceEntry) -> Result<(), Error> {
         self.timestamps.push(entry.timestamp);
@@ -391,6 +399,14 @@ impl TraceWriter {
     pub fn finish(mut self) -> Result<(), Error> {
         self.flush_batch()?;
         self.writer.close()?;
+        Ok(())
+    }
+
+    /// Like [`finish`](Self::finish), then flush the file to stable storage
+    /// (`File::sync_all`) before returning.
+    pub fn finish_synced(mut self) -> Result<(), Error> {
+        self.flush_batch()?;
+        self.writer.into_inner()?.sync_all()?;
         Ok(())
     }
 }

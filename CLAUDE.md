@@ -14,6 +14,8 @@ cargo build              # dev build
 cargo build --release    # optimized (lto, codegen-units=1)
 cargo test               # all unit tests
 cargo clippy --all-targets -- -D warnings   # lint (CI enforces zero warnings)
+cargo clippy --all-targets --no-default-features -- -D warnings   # lint without hf-fetch
+cargo test -- --ignored   # network test: fetches a config from huggingface.co
 cargo fmt --all --check  # format check (CI enforces)
 ```
 
@@ -24,6 +26,8 @@ CI runs on ubuntu, macos, and windows. All four checks (lint, 3x build-and-test)
 ```
 src/lib.rs          Policy enums (SegcachePolicy, CuckooPolicy), Error type
 src/trace.rs        TraceEntry, TraceReader/Writer, Parquet I/O, format converters
+src/mooncake.rs     Mooncake trace → KV-cache object trace (ModelSizes, convert_mooncake_to_parquet)
+src/hf.rs           Hugging Face config.json fetch + cache (feature `hf-fetch`, default on)
 src/oracle.rs       OracleCache with Belady/BeladySize policies
 src/simulator.rs    SimConfig/CuckooConfig, simulate_segcache()/simulate_cuckoo()/simulate_oracle(), SimResult
 src/main.rs         CLI (clap): simulate, convert, info subcommands
@@ -59,7 +63,7 @@ Each engine has its own config struct, simulation function, and policy enum:
 
 ### Trace format
 
-Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `obj_size` (u32), `next_access_vtime` (i64). Optional: `op` (u8), `ttl` (i32). Import from libCacheSim binary or pelikan-io/cache-trace CSV via `convert` subcommand.
+Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `obj_size` (u32), `next_access_vtime` (i64). Optional: `op` (u8), `ttl` (i32). Import from libCacheSim binary, pelikan-io/cache-trace CSV, or Mooncake JSON lines via `convert` subcommand.
 
 ## Conventions
 

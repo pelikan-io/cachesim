@@ -1,0 +1,8 @@
+{
+  "head_dim": 128,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_hidden_layers": 36,
+  "num_key_value_heads": 8,
+  "torch_dtype": "bfloat16"
+}

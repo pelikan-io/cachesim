@@ -16,9 +16,10 @@ It also includes oracle (offline-optimal) eviction policies — Belady and
 BeladySize — as theoretical baselines.
 
 Traces are stored on disk as [Parquet](https://parquet.apache.org/) files, and
-cachesim can import libCacheSim's binary trace formats and
-[pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV files
-directly.
+cachesim can import libCacheSim's binary trace formats,
+[pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV files,
+and the public [Mooncake](https://github.com/kvcache-ai/Mooncake) LLM serving
+traces (expanded into KV-cache object traces) directly.
 
 ## Data Format
 
@@ -123,12 +124,149 @@ Field mapping during import:
 | `ttl`         | `ttl`                | 0 -> null, >0 -> Some                       |
 | —             | `next_access_vtime`  | set to `-1` (not available in CSV)          |
 
+### Mooncake KV-cache traces
+
+`-f mooncake` converts a Mooncake trace (FAST '25, JSON lines) into a trace
+of KV-cache objects, as an LLM serving engine with an external KV store
+(LMCache-style) would read them. Each input line is one request:
+
+```json
+{"timestamp": 27482, "input_length": 6955, "output_length": 52, "hash_ids": [46, 47, 48]}
+```
+
+`timestamp` is in milliseconds. Each `hash_ids` entry names one 512-token
+prompt block; equal ids mean equal prefix content. The last block holds
+`input_length - 512 * (n - 1)` tokens, clamped to 1..512.
+
+Objects (defaults follow LMCache v0.5.5):
+
+- One object is one chunk of `--chunk-tokens` tokens (default 256) of a
+  block, across all layers. Its size is tokens × KV bytes per token.
+- `--tp N`: each tensor-parallel rank stores its own shard, so each chunk is
+  N objects. A rank's KV share follows vLLM v0.31 (db9527a), which splits
+  KV heads across ranks and replicates them once N reaches the head count
+  (`vllm/model_executor/layers/linear.py:1053-1058`,
+  `vllm/config/model.py:1625-1628`): with `h = num_key_value_heads` a rank
+  holds 1/min(N, h) of the KV. vLLM requires `h % N == 0` when `N < h` and
+  `N % h == 0` otherwise, and so does the converter. With
+  `--kv-bytes-per-token` there is no head count and the share is 1/N. The
+  recurrent state is split by linear-attention value heads, which N must
+  divide (`vllm/model_executor/layers/mamba/mamba_utils.py:295-299`), so a
+  rank holds 1/N of it. N must also divide `num_attention_heads`
+  (`linear.py:1052`) and, for hybrid models, the linear-attention
+  convolution width `2 × linear_num_key_heads × linear_key_head_dim +
+  linear_num_value_heads × linear_value_head_dim` (`mamba_utils.py:289-293`),
+  as vLLM requires. A per-rank size that is not a whole number of bytes
+  is an error, not rounded. MLA models (`kv_lora_rank` in the config) are
+  stored by the first rank only, at full size. The divisors are recorded as
+  `kvtrace.kv_tp_divisor` and `kvtrace.state_tp_divisor` (`none` for a
+  model without recurrent state).
+- Hybrid models (linear-attention layers with a recurrent state):
+  `--state-mode per-request` (default) stores one state snapshot at each
+  request's last chunk; `per-chunk` stores one at every chunk.
+  `--state-layout combined` (default) adds the state bytes to that chunk's
+  object, which becomes a distinct object kind; `separate` stores the state
+  as its own object.
+
+Columns:
+
+| Column              | Value                                                  |
+|---------------------|--------------------------------------------------------|
+| `timestamp`         | request timestamp, ms → ns                             |
+| `obj_id`            | `block << 24 \| chunk << 16 \| kind << 12 \| rank`     |
+| `obj_size`          | first size seen for the `obj_id` (see below)           |
+| `next_access_vtime` | row index of the next access to the `obj_id`, or `-1`  |
+| `op`                | `1` (GET) on every row                                 |
+| `ttl`               | null                                                   |
+
+`kind` is 0 for KV, 1 for a separate state object, and 2 for KV and state in
+one object. Every row is a GET: on a miss the engine computes the chunk and
+stores it, so writes in a replay come from fill on miss. If an id recurs with
+a different computed size (a partial last block that later appears full), the
+first size is kept and the row is counted in `kvtrace.size_conflicts`.
+
+Model sizes come from one of:
+
+- `--model <repo id>` (with optional `--revision`, default `main`; a single
+  branch, tag or commit name, so `refs/pr/N` and names containing `/` are
+  not accepted): fetch the
+  model's `config.json` from Hugging Face. `HF_TOKEN`, if set, is sent as a
+  bearer token for gated models. Fetched files are cached at
+  `<cache>/<repo id>/<revision>/config.json`, where `<cache>` is
+  `$HF_HOME/cachesim/configs`, else `$XDG_CACHE_HOME/cachesim/hf-configs`,
+  else `~/.cache/cachesim/hf-configs` (`%LOCALAPPDATA%\cachesim\hf-configs`
+  on Windows). A cached file is used without contacting the network, so later
+  conversions work offline; delete it, or pass a commit hash as the
+  revision, to fetch another version. Requires the `hf-fetch` cargo feature
+  (on by default; build with `--no-default-features` to drop the HTTP
+  client).
+- `--model-config <path>`: a local `config.json`.
+- `--kv-bytes-per-token <bytes>`, optionally with `--state-bytes <bytes>`.
+
+From a config (fields read from `text_config` when present):
+
+- Full-attention layers: the `full_attention` entries of `layer_types`, else
+  `num_hidden_layers / full_attention_interval`, else `num_hidden_layers`.
+  The remaining layers are linear-attention layers. Configs the converter
+  cannot size are rejected: a `layer_types` entry other than
+  `full_attention` or `linear_attention` (e.g. `sliding_attention`), a
+  `sliding_window` without `layer_types` (unless `use_sliding_window` is
+  false), and Mamba-style hybrids (`hybrid_override_pattern`,
+  `layers_block_type`).
+- KV bytes per token: full layers × `num_key_value_heads` × `head_dim`
+  (default `hidden_size / num_attention_heads`) × 2 × dtype bytes; for MLA,
+  full layers × (`kv_lora_rank` + `qk_rope_head_dim`) × dtype bytes. The
+  dtype is `--kv-dtype`, else `torch_dtype`, else `dtype`, else bfloat16.
+- State bytes per sequence: linear layers × `linear_num_value_heads` ×
+  `linear_key_head_dim` × `linear_value_head_dim` × state dtype bytes. The
+  state dtype is `mamba_ssm_dtype` when the config sets it (Qwen3.5 configs
+  set float32, and vLLM copies it: `vllm/model_executor/models/config.py:819-843`
+  at v0.31, db9527a). Otherwise it is the model dtype, not `--kv-dtype`:
+  vLLM's `mamba_ssm_cache_dtype` "auto" uses the conv-state dtype, which
+  defaults to the model dtype (`vllm/model_executor/layers/mamba/mamba_utils.py:98-110`),
+  and Qwen3-Next takes that path (`models/qwen3_next.py:879-887`).
+  Convolution state is not counted. Size products that overflow 64 bits are
+  an error.
+
+For example, Qwen/Qwen3-8B is 36 × 8 × 128 × 2 × 2 = 147,456 bytes per token.
+
+Provenance is written to the Parquet footer as key-value metadata under
+`kvtrace.*` keys: source file name and SHA-256, model id, revision and config
+SHA-256, derived sizes and layer counts, chunk size, TP degree, state mode and
+layout, request count, size-conflict count, and the `obj_id` layout.
+
+The converter reads the input twice, so the input must be an uncompressed
+regular file: directories, pipes (including a piped `/dev/stdin`) and
+`.zst`/`.zstd`/`.gz` files (any letter case) are rejected; decompress first. The first pass builds the `obj_id` column (8 bytes per
+row), which a reverse scan overwrites in place with `next_access_vtime`; the
+scan's map of distinct objects is then freed. That column and a map from
+each distinct object to its size stay in memory through the second pass,
+which regenerates the rows and streams them to the writer. The input's
+SHA-256 must match across the two passes.
+
+Output handling, all checked before the first pass:
+
+- An output that is the input file (same path, a symlink to it, or a hard
+  link), a directory, or an existing read-only file is refused.
+- An output that is a symlink is followed: the result is written to the file
+  it links to, and the link is kept. A dangling symlink is refused.
+- A device or pipe such as `/dev/null` is written directly.
+- Otherwise the result is written to `.<name>.<pid>.<n>.tmp` in the
+  destination's directory, flushed to disk, and renamed over the destination
+  only on success. An ordinary error removes the temporary file and leaves
+  an existing output unchanged; a killed run leaves the temporary file
+  behind, to be deleted by hand.
+- On Windows the final rename can fail if another process has the
+  destination open.
+
 ## Code Architecture
 
 ```
 src/
 ├── lib.rs          # Crate root, module declarations, Error type
 ├── trace.rs        # Trace data model, Parquet I/O, format conversion
+├── mooncake.rs     # Mooncake trace → KV-cache object trace
+├── hf.rs           # Hugging Face config.json fetch and cache (hf-fetch feature)
 ├── oracle.rs       # Belady and BeladySize oracle caches
 ├── simulator.rs    # Cache simulation engine
 └── main.rs         # CLI (clap)
@@ -146,8 +284,24 @@ src/
   format to Parquet.
 - **`convert_cache_trace_to_parquet()`** — streaming conversion from
   pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
+- **`TraceWriter::append_key_value_metadata()`** — add a key-value pair to
+  the Parquet footer.
 - **`Op`** — operation enum matching `req_op_e`, with `is_read()` /
   `is_write()` / `is_delete()` classification helpers.
+
+### `mooncake` module
+
+- **`ModelSizes`** — KV bytes per token and recurrent-state bytes per
+  sequence, from a Hugging Face `config.json` (`from_config_file()`,
+  `from_config_bytes()`) or given directly (`explicit()`).
+- **`MooncakeOptions`** — sizes, chunk size, TP degree, state mode and
+  layout, and provenance fields.
+- **`convert_mooncake_to_parquet()`** — two-pass conversion described above.
+
+### `hf` module
+
+- **`fetch_config()`** — return a model's `config.json`, from the cache or
+  downloaded. Built with the `hf-fetch` feature.
 
 ### `oracle` module
 
@@ -193,7 +347,7 @@ Three subcommands:
 | Command     | Description                                                  |
 |-------------|--------------------------------------------------------------|
 | `simulate`  | Replay a Parquet trace against segcache, cuckoo, or oracle   |
-| `convert`   | Import a trace to Parquet (binary or CSV)                    |
+| `convert`   | Import a trace to Parquet (binary, CSV, or Mooncake)         |
 | `info`      | Print summary statistics for a Parquet trace file            |
 
 ## Usage
@@ -204,6 +358,17 @@ cachesim convert -i trace.oracleGeneral.bin -o trace.parquet
 
 # Convert a pelikan-io/cache-trace CSV (zstd-compressed)
 cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
+
+# Convert a Mooncake trace to KV-cache objects, model config from Hugging Face
+cachesim convert -i conversation_trace.jsonl -o conv.parquet -f mooncake \
+    --model Qwen/Qwen3-8B
+
+# Hybrid model, tensor parallel 8, offline with a local config.json.
+# Qwen3.8-27B has 4 KV heads, so each of the 8 ranks holds 1/4 of the KV
+# (16,384 B/token) and 1/8 of the recurrent state (18,874,368 B).
+cachesim convert -i conversation_trace.jsonl -o conv-tp8.parquet -f mooncake \
+    --model-config config.json --model-name Qwen/Qwen3.8-27B --tp 8 \
+    --state-mode per-request --state-layout combined
 
 # Run a simulation (64 MB cache, FIFO eviction via segcache)
 cachesim simulate -t trace.parquet -c 64M segcache -p fifo
@@ -225,6 +390,33 @@ cachesim simulate -t trace.parquet -c 64M oracle -p belady-size
 
 # Inspect a trace
 cachesim info -t trace.parquet
+```
+
+### Convert options
+
+```
+-i, --input <PATH>         Input trace file (required)
+-o, --output <PATH>        Output Parquet file (required)
+-f, --format <FORMAT>      oracle-general | oracle-general-op-ns | cache-trace | mooncake
+                           [default: oracle-general]
+```
+
+Mooncake options (`-f mooncake`; one of `--model`, `--model-config`,
+`--kv-bytes-per-token` is required):
+
+```
+    --model <REPO_ID>            Fetch config.json from Hugging Face (cached)
+    --revision <REV>             Revision of --model [default: main]
+    --model-config <PATH>        Local config.json
+    --kv-bytes-per-token <N>     KV bytes per token, instead of a config
+    --state-bytes <N>            Recurrent-state bytes per sequence, with --kv-bytes-per-token
+    --kv-dtype <DTYPE>           Override the config's KV dtype
+                                 (bfloat16, float16, float32, fp8, float8_e4m3fn)
+    --model-name <NAME>          Model id for the metadata (with --model-config or explicit sizes)
+    --chunk-tokens <N>           Tokens per object; divides 512 [default: 256]
+    --tp <N>                     Tensor-parallel degree [default: 1]
+    --state-mode <MODE>          per-request | per-chunk [default: per-request]
+    --state-layout <LAYOUT>      combined | separate [default: combined]
 ```
 
 ### Simulate options

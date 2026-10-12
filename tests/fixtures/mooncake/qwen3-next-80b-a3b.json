@@ -1,0 +1,15 @@
+{
+  "full_attention_interval": 4,
+  "head_dim": 256,
+  "hidden_size": 2048,
+  "linear_key_head_dim": 128,
+  "linear_num_key_heads": 16,
+  "linear_num_value_heads": 32,
+  "linear_value_head_dim": 128,
+  "num_attention_heads": 16,
+  "num_hidden_layers": 48,
+  "num_key_value_heads": 2,
+  "sliding_window": null,
+  "torch_dtype": "bfloat16",
+  "use_sliding_window": false
+}
