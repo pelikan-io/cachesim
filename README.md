@@ -220,8 +220,8 @@ SHA-256, derived sizes and layer counts, chunk size, TP degree, state mode and
 layout, request count, size-conflict count, and the `obj_id` layout.
 
 The converter reads the input twice, so the input must be an uncompressed
-regular file: pipes, `/dev/stdin` and `.zst`/`.gz` files are rejected
-(decompress first). The first pass builds the `obj_id` column (8 bytes per
+regular file: pipes (including a piped `/dev/stdin`) and `.zst`/`.gz`
+files are rejected (decompress first). The first pass builds the `obj_id` column (8 bytes per
 row), which a reverse scan overwrites in place with `next_access_vtime`; the
 scan's map of distinct objects is then freed. That column and a map from
 each distinct object to its size stay in memory through the second pass,

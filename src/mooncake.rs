@@ -54,8 +54,9 @@
 //!
 //! # Memory
 //!
-//! The input is read twice, so it must be a regular file (not a pipe or
-//! `/dev/stdin`), and it must be uncompressed. The first pass computes every
+//! The input is read twice through one rewound handle, so it must be an
+//! uncompressed regular file: a pipe is rejected, while `/dev/stdin`
+//! redirected from a regular file works. The first pass computes every
 //! row's `obj_id` into one 8-byte-per-row column. A reverse scan then
 //! overwrites that column in place with `next_access_vtime`, using a map with
 //! one entry per distinct object that is freed afterwards. The column (8 bytes
@@ -67,7 +68,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -577,14 +578,15 @@ impl<R: Read> Read for HashingReader<R> {
     }
 }
 
-/// Read every request of `path`, call `f` on each, and return the file's
-/// SHA-256 as lowercase hex.
+/// Read every request of `file` from its start, call `f` on each, and return
+/// the file's SHA-256 as lowercase hex.
 fn for_each_request(
-    path: &Path,
+    file: &mut File,
     mut f: impl FnMut(&Request) -> Result<(), Error>,
 ) -> Result<String, Error> {
+    file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(HashingReader {
-        inner: File::open(path)?,
+        inner: file,
         hasher: Sha256::new(),
     });
     let mut line = String::new();
@@ -626,10 +628,13 @@ pub fn convert_mooncake_to_parquet(
     opts.validate()?;
     let input = input.as_ref();
     let output = output.as_ref();
-    if !std::fs::metadata(input)?.is_file() {
+    // One handle, rewound for the second pass, so a redirected /dev/stdin
+    // that is a regular file reads the same bytes twice.
+    let mut file = File::open(input)?;
+    if !file.metadata()?.is_file() {
         return Err(Error::InvalidFormat(format!(
             "mooncake: {} is not a regular file; the converter reads its input twice, \
-             so pipes and /dev/stdin are not supported",
+             so pipes are not supported",
             input.display()
         )));
     }
@@ -649,7 +654,7 @@ pub fn convert_mooncake_to_parquet(
     let mut first_size: HashMap<u64, u32> = HashMap::new();
     let mut size_conflicts = 0usize;
     let mut requests = 0usize;
-    let sha256 = for_each_request(input, |req| {
+    let sha256 = for_each_request(&mut file, |req| {
         requests += 1;
         expand_request(req, opts, |id, size| {
             let size = u32::try_from(size).map_err(|_| {
@@ -765,7 +770,7 @@ pub fn convert_mooncake_to_parquet(
             writer.append_key_value_metadata(k, v);
         }
         let mut row = 0usize;
-        let sha256_again = for_each_request(input, |req| {
+        let sha256_again = for_each_request(&mut file, |req| {
             expand_request(req, opts, |id, _| {
                 let (size, next) = match (first_size.get(&id), next_access.get(row)) {
                     (Some(&s), Some(&n)) => (s, n as i64),
