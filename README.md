@@ -261,35 +261,62 @@ Output handling, all checked before the first pass:
 
 ## Code Architecture
 
+The repository is a Cargo workspace of two crates:
+
 ```
-src/
-├── lib.rs          # Crate root, module declarations, Error type
-├── trace.rs        # Trace data model, Parquet I/O, format conversion
-├── mooncake.rs     # Mooncake trace → KV-cache object trace
-├── hf.rs           # Hugging Face config.json fetch and cache (hf-fetch feature)
-├── oracle.rs       # Belady and BeladySize oracle caches
-├── simulator.rs    # Cache simulation engine
-└── main.rs         # CLI (clap)
+crates/
+├── cachetrace/          # Object-level trace format (library)
+│   └── src/
+│       ├── lib.rs       # Schema, TraceEntry, Op, TraceReader, TraceWriter, Error
+│       └── import.rs    # libCacheSim binary and cache-trace CSV importers (`import` feature)
+└── cachesim/            # Package `cachesim-rs`: library `cachesim`, binary `cachesim`
+    ├── src/
+    │   ├── lib.rs       # Policy enums, Error, `trace` re-export of cachetrace
+    │   ├── mooncake.rs  # Mooncake trace → KV-cache object trace
+    │   ├── hf.rs        # Hugging Face config.json fetch and cache (hf-fetch feature)
+    │   ├── oracle.rs    # Belady and BeladySize oracle caches
+    │   ├── simulator.rs # Cache simulation engine
+    │   └── main.rs      # CLI (clap)
+    └── tests/           # Integration tests and Mooncake fixtures
 ```
 
-### `trace` module
+`cachesim` depends on `cachetrace` with the `import` feature. Each crate has
+its own `Error`; a `cachetrace::Error` converts into the `cachesim::Error`
+variant of the same name (`Io`, `Parquet`, `Arrow`, `InvalidFormat`), so `?`
+works across the two.
+
+### `cachetrace` crate
+
+The trace format on its own, for programs that read or write object-level
+traces without the simulator. `cachesim` re-exports it as `cachesim::trace`,
+so code written against `cachesim::trace::*` keeps compiling.
 
 - **`TraceEntry`** — one cache request (the in-memory row type).
+- **`trace_schema()`** — the Arrow schema of a trace file.
 - **`TraceReader`** — opens a Parquet file and streams `Result<TraceEntry>` values
   one record batch at a time, so traces larger than memory replay at a fixed
   footprint. The footer's row count is available up front via `total_entries()`.
 - **`TraceWriter`** — buffers entries into Arrow `RecordBatch`es and writes
   them to a ZSTD-compressed Parquet file.
-- **`convert_bin_to_parquet()`** — streaming conversion from libCacheSim binary
-  format to Parquet.
-- **`convert_cache_trace_to_parquet()`** — streaming conversion from
-  pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
 - **`TraceWriter::append_key_value_metadata()`** — add a key-value pair to
   the Parquet footer.
 - **`Op`** — operation enum matching `req_op_e`, with `is_read()` /
   `is_write()` / `is_delete()` classification helpers.
 
-### `mooncake` module
+With the `import` feature (on by default):
+
+- **`convert_bin_to_parquet()`** — streaming conversion from libCacheSim binary
+  format to Parquet.
+- **`convert_cache_trace_to_parquet()`** — streaming conversion from
+  pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
+
+`cachetrace = { version = "0.1", default-features = false }` gives the
+schema, row type, reader and writer only, without the importers' `ahash` and
+`zstd` dependencies.
+
+### `cachesim` crate
+
+#### `mooncake` module
 
 - **`ModelSizes`** — KV bytes per token and recurrent-state bytes per
   sequence, from a Hugging Face `config.json` (`from_config_file()`,
@@ -298,12 +325,12 @@ src/
   layout, and provenance fields.
 - **`convert_mooncake_to_parquet()`** — two-pass conversion described above.
 
-### `hf` module
+#### `hf` module
 
 - **`fetch_config()`** — return a model's `config.json`, from the cache or
   downloaded. Built with the `hf-fetch` feature.
 
-### `oracle` module
+#### `oracle` module
 
 Offline-optimal eviction policies that use the `next_access_vtime` column
 (future knowledge) to make perfect eviction decisions. These serve as
@@ -320,7 +347,7 @@ theoretical upper bounds when evaluating online policies.
   queue. Supports `lookup` (hit + update oracle data), `insert` (with
   eviction), and `remove`.
 
-### `simulator` module
+#### `simulator` module
 
 - **`SimConfig`** — all knobs for a segcache run: cache size, segment size,
   hash power, eviction policy, default TTL, max object size.
@@ -340,7 +367,7 @@ theoretical upper bounds when evaluating online policies.
 - **`simulate_oracle()`** — same replay loop but against an `OracleCache`.
   Only needs cache size and oracle policy (engine-specific knobs do not apply).
 
-### CLI (`main.rs`)
+#### CLI (`main.rs`)
 
 Three subcommands:
 
@@ -487,7 +514,8 @@ segcache-specific options (segment size, hash power, TTL).
 ## Building
 
 ```bash
-cargo build --release
+cargo build --release            # target/release/cachesim
+cargo test --workspace
 ```
 
 ## License
