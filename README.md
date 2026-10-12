@@ -171,7 +171,9 @@ first size is kept and the row is counted in `kvtrace.size_conflicts`.
 
 Model sizes come from one of:
 
-- `--model <repo id>` (with optional `--revision`, default `main`): fetch the
+- `--model <repo id>` (with optional `--revision`, default `main`; a single
+  branch, tag or commit name, so `refs/pr/N` and names containing `/` are
+  not accepted): fetch the
   model's `config.json` from Hugging Face. `HF_TOKEN`, if set, is sent as a
   bearer token for gated models. Fetched files are cached at
   `<cache>/<repo id>/<revision>/config.json`, where `<cache>` is
@@ -189,14 +191,26 @@ From a config (fields read from `text_config` when present):
 
 - Full-attention layers: the `full_attention` entries of `layer_types`, else
   `num_hidden_layers / full_attention_interval`, else `num_hidden_layers`.
-  The remaining layers are linear-attention layers.
+  The remaining layers are linear-attention layers. Configs the converter
+  cannot size are rejected: a `layer_types` entry other than
+  `full_attention` or `linear_attention` (e.g. `sliding_attention`), a
+  `sliding_window` without `layer_types` (unless `use_sliding_window` is
+  false), and Mamba-style hybrids (`hybrid_override_pattern`,
+  `layers_block_type`).
 - KV bytes per token: full layers × `num_key_value_heads` × `head_dim`
   (default `hidden_size / num_attention_heads`) × 2 × dtype bytes; for MLA,
   full layers × (`kv_lora_rank` + `qk_rope_head_dim`) × dtype bytes. The
   dtype is `--kv-dtype`, else `torch_dtype`, else `dtype`, else bfloat16.
 - State bytes per sequence: linear layers × `linear_num_value_heads` ×
-  `linear_key_head_dim` × `linear_value_head_dim` × `mamba_ssm_dtype` bytes
-  (default float32). Convolution state is not counted.
+  `linear_key_head_dim` × `linear_value_head_dim` × state dtype bytes. The
+  state dtype is `mamba_ssm_dtype` when the config sets it (Qwen3.5 configs
+  set float32, and vLLM copies it: `vllm/model_executor/models/config.py:819-843`
+  at v0.31, db9527a). Otherwise it is the model dtype, not `--kv-dtype`:
+  vLLM's `mamba_ssm_cache_dtype` "auto" uses the conv-state dtype, which
+  defaults to the model dtype (`vllm/model_executor/layers/mamba/mamba_utils.py:98-110`),
+  and Qwen3-Next takes that path (`models/qwen3_next.py:879-887`).
+  Convolution state is not counted. Size products that overflow 64 bits are
+  an error.
 
 For example, Qwen/Qwen3-8B is 36 × 8 × 128 × 2 × 2 = 147,456 bytes per token.
 
@@ -205,11 +219,15 @@ Provenance is written to the Parquet footer as key-value metadata under
 SHA-256, derived sizes and layer counts, chunk size, TP degree, state mode and
 layout, request count, size-conflict count, and the `obj_id` layout.
 
-The converter reads the input twice. The first pass keeps the `obj_id`
-column in memory (8 bytes per row, plus one entry per distinct object) to
-compute `next_access_vtime` by a reverse scan; the second pass regenerates
-the rows and streams them to the writer. The input's SHA-256 must match
-across the two passes.
+The converter reads the input twice, so the input must be an uncompressed
+regular file: pipes, `/dev/stdin` and `.zst`/`.gz` files are rejected
+(decompress first). The first pass builds the `obj_id` column (8 bytes per
+row), which a reverse scan overwrites in place with `next_access_vtime`; the
+scan's map of distinct objects is then freed. That column and a map from
+each distinct object to its size stay in memory through the second pass,
+which regenerates the rows and streams them to the writer. The input's
+SHA-256 must match across the two passes. The output file is created only
+after the first pass succeeds and is removed if the second pass fails.
 
 ## Code Architecture
 

@@ -54,12 +54,16 @@
 //!
 //! # Memory
 //!
-//! The input is read twice. The first pass computes every row's `obj_id` and
-//! keeps that column in memory (8 bytes per row) to derive
-//! `next_access_vtime` in a reverse pass, plus one entry per distinct object
-//! for its size. The second pass regenerates the rows and streams them to the
-//! Parquet writer. The input's SHA-256 is checked on both passes, so a file
-//! that changes in between is an error.
+//! The input is read twice, so it must be a regular file (not a pipe or
+//! `/dev/stdin`), and it must be uncompressed. The first pass computes every
+//! row's `obj_id` into one 8-byte-per-row column. A reverse scan then
+//! overwrites that column in place with `next_access_vtime`, using a map with
+//! one entry per distinct object that is freed afterwards. The column (8 bytes
+//! per row) and a second map from each distinct object to its size stay in
+//! memory through the second pass, which regenerates the rows and streams
+//! them to the Parquet writer. The input's SHA-256 is checked on both passes,
+//! so a file that changes in between is an error. The output file is created
+//! only after the first pass succeeds and is removed if the second pass fails.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -184,6 +188,11 @@ impl ModelSizes {
     /// * Full-attention layers: the `"full_attention"` entries of
     ///   `layer_types`; else `num_hidden_layers / full_attention_interval`;
     ///   else all of `num_hidden_layers`. The rest are linear-attention layers.
+    ///   A `layer_types` entry other than `"full_attention"` or
+    ///   `"linear_attention"`, a `sliding_window` without `layer_types`, or a
+    ///   Mamba-style hybrid layout (`hybrid_override_pattern`,
+    ///   `layers_block_type`) is an error, since those layers cannot be sized
+    ///   here.
     /// * KV bytes per token: full layers × `num_key_value_heads` × `head_dim`
     ///   (default `hidden_size / num_attention_heads`) × 2 (K and V) × dtype
     ///   bytes. MLA models (`kv_lora_rank` set): full layers ×
@@ -191,17 +200,54 @@ impl ModelSizes {
     /// * KV dtype: `kv_dtype`, else `torch_dtype` (text config, then top
     ///   level), else `dtype` (same order), else bfloat16.
     /// * State bytes per sequence: linear layers × `linear_num_value_heads` ×
-    ///   `linear_key_head_dim` × `linear_value_head_dim` × `mamba_ssm_dtype`
-    ///   bytes (default float32).
+    ///   `linear_key_head_dim` × `linear_value_head_dim` × state dtype bytes.
+    ///   The state dtype is `mamba_ssm_dtype`, else the model dtype
+    ///   (`torch_dtype`, else `dtype`, else bfloat16; not `kv_dtype`).
+    ///
+    /// Products that overflow `u64` are an error.
     pub fn from_config(config: &Value, kv_dtype: Option<&str>) -> Result<Self, Error> {
         let t = config.get("text_config").unwrap_or(config);
         let layers = req_u64(t, "num_hidden_layers")?;
 
+        for key in ["hybrid_override_pattern", "layers_block_type"] {
+            if t.get(key).is_some_and(|v| !v.is_null()) {
+                return Err(bad_config(&format!(
+                    "{key} (Mamba-style hybrid layers) is not supported"
+                )));
+            }
+        }
+
         let full = match t.get("layer_types").and_then(Value::as_array) {
-            Some(types) if !types.is_empty() => types
-                .iter()
-                .filter(|x| x.as_str() == Some("full_attention"))
-                .count() as u64,
+            Some(types) if !types.is_empty() => {
+                if types.len() as u64 != layers {
+                    return Err(bad_config(&format!(
+                        "layer_types has {} entries but num_hidden_layers is {layers}",
+                        types.len()
+                    )));
+                }
+                let mut full = 0;
+                for x in types {
+                    match x.as_str() {
+                        Some("full_attention") => full += 1,
+                        Some("linear_attention") => {}
+                        _ => {
+                            return Err(bad_config(&format!(
+                                "unsupported layer_types entry {x} (only full_attention \
+                                 and linear_attention can be sized)"
+                            )))
+                        }
+                    }
+                }
+                full
+            }
+            _ if t.get("sliding_window").is_some_and(|v| {
+                !v.is_null() && t.get("use_sliding_window") != Some(&Value::Bool(false))
+            }) =>
+            {
+                return Err(bad_config(
+                    "sliding_window without layer_types: sliding-window layers cannot be sized",
+                ));
+            }
             _ => match opt_u64(t, "full_attention_interval")? {
                 Some(interval) if interval > 0 => layers / interval,
                 _ => layers,
@@ -213,43 +259,55 @@ impl ModelSizes {
             ))
         })?;
 
-        let dtype = match kv_dtype {
-            Some(d) => d.to_string(),
-            None => ["torch_dtype", "dtype"]
-                .iter()
-                .flat_map(|k| [t.get(*k), config.get(*k)])
-                .flatten()
-                .find_map(|v| v.as_str())
-                .unwrap_or("bfloat16")
-                .to_string(),
-        };
+        let model_dtype = ["torch_dtype", "dtype"]
+            .iter()
+            .flat_map(|k| [t.get(*k), config.get(*k)])
+            .flatten()
+            .find_map(|v| v.as_str())
+            .unwrap_or("bfloat16");
+        let dtype = kv_dtype.unwrap_or(model_dtype);
         let dt =
-            dtype_bytes(&dtype).ok_or_else(|| bad_config(&format!("unknown dtype {dtype:?}")))?;
+            dtype_bytes(dtype).ok_or_else(|| bad_config(&format!("unknown dtype {dtype:?}")))?;
 
         let kv_lora_rank = opt_u64(t, "kv_lora_rank")?.filter(|&r| r > 0);
         let kv_bytes_per_token = match kv_lora_rank {
-            Some(rank) => full * (rank + req_u64(t, "qk_rope_head_dim")?) * dt,
+            Some(rank) => {
+                let latent = rank
+                    .checked_add(req_u64(t, "qk_rope_head_dim")?)
+                    .ok_or_else(overflow)?;
+                product(&[full, latent, dt])?
+            }
             None => {
                 let head_dim = match opt_u64(t, "head_dim")?.filter(|&h| h > 0) {
                     Some(h) => h,
-                    None => req_u64(t, "hidden_size")? / req_u64(t, "num_attention_heads")?,
+                    None => req_u64(t, "hidden_size")?
+                        .checked_div(req_u64(t, "num_attention_heads")?)
+                        .ok_or_else(|| bad_config("num_attention_heads is 0"))?,
                 };
-                full * req_u64(t, "num_key_value_heads")? * head_dim * 2 * dt
+                product(&[full, req_u64(t, "num_key_value_heads")?, head_dim, 2, dt])?
             }
         };
 
         let state_bytes_per_sequence = if linear > 0 {
+            // Without mamba_ssm_dtype the state takes the model dtype. vLLM
+            // v0.31 (db9527a), vllm/model_executor/layers/mamba/mamba_utils.py:98-110:
+            // with mamba_ssm_cache_dtype "auto" the SSM state uses the conv-state
+            // dtype, which defaults to the model dtype; Qwen3-Next's gated delta
+            // net takes this path (models/qwen3_next.py:879-887). Qwen3.5 instead
+            // copies the config's mamba_ssm_dtype (models/config.py:819-843).
             let sdtype = t
                 .get("mamba_ssm_dtype")
                 .and_then(Value::as_str)
-                .unwrap_or("float32");
+                .unwrap_or(model_dtype);
             let sdt = dtype_bytes(sdtype)
-                .ok_or_else(|| bad_config(&format!("unknown mamba_ssm_dtype {sdtype:?}")))?;
-            linear
-                * req_u64(t, "linear_num_value_heads")?
-                * req_u64(t, "linear_key_head_dim")?
-                * req_u64(t, "linear_value_head_dim")?
-                * sdt
+                .ok_or_else(|| bad_config(&format!("unknown state dtype {sdtype:?}")))?;
+            product(&[
+                linear,
+                req_u64(t, "linear_num_value_heads")?,
+                req_u64(t, "linear_key_head_dim")?,
+                req_u64(t, "linear_value_head_dim")?,
+                sdt,
+            ])?
         } else {
             0
         };
@@ -276,6 +334,18 @@ fn opt_u64(v: &Value, key: &str) -> Result<Option<u64>, Error> {
 
 fn req_u64(v: &Value, key: &str) -> Result<u64, Error> {
     opt_u64(v, key)?.ok_or_else(|| bad_config(&format!("missing {key}")))
+}
+
+/// Product of `factors`, or an error if it overflows `u64`.
+fn product(factors: &[u64]) -> Result<u64, Error> {
+    factors
+        .iter()
+        .try_fold(1u64, |acc, &f| acc.checked_mul(f))
+        .ok_or_else(overflow)
+}
+
+fn overflow() -> Error {
+    Error::InvalidFormat("mooncake: a size computation overflows u64".into())
 }
 
 fn bad_config(msg: &str) -> Error {
@@ -455,10 +525,14 @@ fn expand_request(
                 StateMode::PerRequest => i == n - 1,
             };
         let combined = snap && opts.state_layout == StateLayout::Combined;
+        let kv = kvt.checked_mul(ctok).ok_or_else(overflow)?;
         let (kind, bytes) = if combined {
-            (KIND_KV_WITH_STATE, kvt * ctok + state)
+            (
+                KIND_KV_WITH_STATE,
+                kv.checked_add(state).ok_or_else(overflow)?,
+            )
         } else {
-            (KIND_KV, kvt * ctok)
+            (KIND_KV, kv)
         };
         for rank in 0..ranks {
             emit(obj_id(block, c, kind, rank)?, bytes / ranks)?;
@@ -551,6 +625,23 @@ pub fn convert_mooncake_to_parquet(
 ) -> Result<MooncakeSummary, Error> {
     opts.validate()?;
     let input = input.as_ref();
+    let output = output.as_ref();
+    if !std::fs::metadata(input)?.is_file() {
+        return Err(Error::InvalidFormat(format!(
+            "mooncake: {} is not a regular file; the converter reads its input twice, \
+             so pipes and /dev/stdin are not supported",
+            input.display()
+        )));
+    }
+    if input
+        .extension()
+        .is_some_and(|e| e == "zst" || e == "zstd" || e == "gz")
+    {
+        return Err(Error::InvalidFormat(format!(
+            "mooncake: {} looks compressed; decompress it first",
+            input.display()
+        )));
+    }
     let created = utc_now_iso8601();
 
     // Pass 1: object ids and the first size of each.
@@ -574,17 +665,16 @@ pub fn convert_mooncake_to_parquet(
         })
     })?;
 
-    // Reverse pass: row index of each id's next access.
-    let mut next_access = vec![-1i64; ids.len()];
-    let mut seen: HashMap<u64, i64> = HashMap::with_capacity(first_size.len());
-    for (i, &id) in ids.iter().enumerate().rev() {
-        if let Some(j) = seen.insert(id, i as i64) {
-            next_access[i] = j;
-        }
+    // Reverse pass: overwrite each id with the row index of its next access,
+    // reusing the column. -1 (no next access) is stored as u64::MAX.
+    let mut next_access = ids;
+    let mut seen: HashMap<u64, u64> = HashMap::with_capacity(first_size.len());
+    for i in (0..next_access.len()).rev() {
+        let id = next_access[i];
+        next_access[i] = seen.insert(id, i as u64).unwrap_or(u64::MAX);
     }
     drop(seen);
-    let rows = ids.len();
-    drop(ids);
+    let rows = next_access.len();
 
     let sizes = &opts.sizes;
     let state = sizes.state_bytes_per_sequence;
@@ -667,34 +757,41 @@ pub fn convert_mooncake_to_parquet(
         metadata.push(("kvtrace.model.config_sha256", sha.clone()));
     }
 
-    // Pass 2: regenerate the rows and stream them out.
-    let mut writer = TraceWriter::create(output, batch_size)?;
-    for (k, v) in metadata {
-        writer.append_key_value_metadata(k, v);
+    // Pass 2: regenerate the rows and stream them out. A failure removes the
+    // partial output.
+    let pass2 = || -> Result<(), Error> {
+        let mut writer = TraceWriter::create(output, batch_size)?;
+        for (k, v) in metadata {
+            writer.append_key_value_metadata(k, v);
+        }
+        let mut row = 0usize;
+        let sha256_again = for_each_request(input, |req| {
+            expand_request(req, opts, |id, _| {
+                let (size, next) = match (first_size.get(&id), next_access.get(row)) {
+                    (Some(&s), Some(&n)) => (s, n as i64),
+                    _ => return Err(changed_input()),
+                };
+                writer.write(&TraceEntry {
+                    timestamp: req.timestamp_ns,
+                    obj_id: id,
+                    obj_size: size,
+                    next_access_vtime: next,
+                    op: Some(Op::Get as u8),
+                    ttl: None,
+                })?;
+                row += 1;
+                Ok(())
+            })
+        })?;
+        if sha256_again != sha256 || row != rows {
+            return Err(changed_input());
+        }
+        writer.finish()
+    };
+    if let Err(e) = pass2() {
+        let _ = std::fs::remove_file(output);
+        return Err(e);
     }
-    let mut row = 0usize;
-    let sha256_again = for_each_request(input, |req| {
-        expand_request(req, opts, |id, _| {
-            let (size, next) = match (first_size.get(&id), next_access.get(row)) {
-                (Some(&s), Some(&n)) => (s, n),
-                _ => return Err(changed_input()),
-            };
-            writer.write(&TraceEntry {
-                timestamp: req.timestamp_ns,
-                obj_id: id,
-                obj_size: size,
-                next_access_vtime: next,
-                op: Some(Op::Get as u8),
-                ttl: None,
-            })?;
-            row += 1;
-            Ok(())
-        })
-    })?;
-    if sha256_again != sha256 || row != rows {
-        return Err(changed_input());
-    }
-    writer.finish()?;
 
     Ok(MooncakeSummary {
         rows,
@@ -787,10 +884,11 @@ mod tests {
             "num_hidden_layers": 48, "full_attention_interval": 4,
             "num_key_value_heads": 2, "head_dim": 256, "torch_dtype": "bfloat16",
             "linear_num_value_heads": 32, "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
+            "linear_value_head_dim": 128, "mamba_ssm_dtype": "float32",
         });
         let s = ModelSizes::from_config(&c, None).unwrap();
-        // 12 full layers x 2 x 256 x 2 x 2; 36 linear layers x 32 x 128 x 128 x 4.
+        // 12 full layers x 2 x 256 x 2 x 2; 36 linear layers x 32 x 128 x 128 x 4
+        // (mamba_ssm_dtype float32 overrides the bf16 model dtype).
         assert_eq!(s.kv_bytes_per_token, 24_576);
         assert_eq!(s.state_bytes_per_sequence, 75_497_472);
     }
@@ -813,6 +911,112 @@ mod tests {
         });
         let s = ModelSizes::from_config(&dense, None).unwrap();
         assert_eq!(s.kv_bytes_per_token, 32 * 8 * 128 * 2 * 2);
+    }
+
+    #[test]
+    fn sizes_state_dtype_defaults_to_model_dtype() {
+        // No mamba_ssm_dtype: the state uses the model dtype (bf16).
+        // KV: 12 full layers x 2 KV heads x 256 x 2 x 2 bytes.
+        // State: 36 linear layers x 32 value heads x 128 x 128 x 2 bytes.
+        let s = ModelSizes::from_config_file(fixture("qwen3-next-80b-a3b.json"), None).unwrap();
+        assert_eq!(s.kv_bytes_per_token, 24_576);
+        assert_eq!(s.state_bytes_per_sequence, 37_748_736);
+        // --kv-dtype changes KV only, not the state.
+        let s =
+            ModelSizes::from_config_file(fixture("qwen3-next-80b-a3b.json"), Some("fp8")).unwrap();
+        assert_eq!(s.kv_bytes_per_token, 12_288);
+        assert_eq!(s.state_bytes_per_sequence, 37_748_736);
+    }
+
+    fn config_err(c: Value) -> String {
+        ModelSizes::from_config(&c, None).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn sizes_unsupported_layouts_are_errors() {
+        let base = json!({
+            "num_hidden_layers": 4, "num_key_value_heads": 8, "head_dim": 64,
+            "torch_dtype": "bfloat16",
+        });
+        let with = |k: &str, v: Value| {
+            let mut c = base.clone();
+            c[k] = v;
+            c
+        };
+        assert!(ModelSizes::from_config(&base, None).is_ok());
+
+        let types = json!([
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention"
+        ]);
+        assert!(config_err(with("layer_types", types)).contains("\"sliding_attention\""));
+        let short = json!(["full_attention", "full_attention"]);
+        assert!(config_err(with("layer_types", short)).contains("2 entries"));
+        assert!(config_err(with("sliding_window", json!(4096))).contains("sliding_window"));
+        assert!(config_err(with("hybrid_override_pattern", json!("M-M*"))).contains("hybrid"));
+        assert!(config_err(with("layers_block_type", json!(["mamba"]))).contains("hybrid"));
+
+        // A sliding_window that is null or switched off is fine.
+        assert!(ModelSizes::from_config(&with("sliding_window", Value::Null), None).is_ok());
+        let mut off = with("sliding_window", json!(4096));
+        off["use_sliding_window"] = json!(false);
+        assert!(ModelSizes::from_config(&off, None).is_ok());
+    }
+
+    #[test]
+    fn sizes_overflow_is_an_error() {
+        let c = json!({
+            "num_hidden_layers": 4, "num_key_value_heads": u64::MAX / 2, "head_dim": 64,
+        });
+        assert!(config_err(c).contains("overflow"));
+        let c = json!({
+            "num_hidden_layers": 8, "full_attention_interval": 2, "num_key_value_heads": 1,
+            "head_dim": 1, "linear_num_value_heads": u64::MAX / 3,
+            "linear_key_head_dim": 1, "linear_value_head_dim": 1,
+        });
+        assert!(config_err(c).contains("overflow"));
+    }
+
+    #[test]
+    fn chunk_size_overflow_is_an_error_and_writes_nothing() {
+        // 2^56 + 1 bytes per token: 256 tokens wraps to 256 bytes in u64.
+        let opts = MooncakeOptions::new(ModelSizes::explicit(72_057_594_037_927_937, 0));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.parquet");
+        let err = convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &opts, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflow"), "{err}");
+        assert!(!out.exists());
+
+        // State added to a chunk's KV.
+        let mut opts = MooncakeOptions::new(ModelSizes::explicit(1, u64::MAX - 10));
+        opts.tp = 1;
+        let err = convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &opts, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflow"), "{err}");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn input_must_be_a_regular_uncompressed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.parquet");
+        let opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+        let err = convert_mooncake_to_parquet(dir.path(), &out, &opts, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        let zst = dir.path().join("trace.jsonl.zst");
+        std::fs::write(&zst, b"").unwrap();
+        let err = convert_mooncake_to_parquet(&zst, &out, &opts, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decompress"), "{err}");
+        assert!(!out.exists());
     }
 
     #[test]
