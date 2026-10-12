@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use cachesim::mooncake::{
+    convert_mooncake_to_parquet, sha256_hex, ModelSizes, MooncakeOptions, StateLayout, StateMode,
+    DTYPE_NAMES,
+};
 use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{
     simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig,
@@ -43,6 +47,9 @@ enum Command {
         /// Format of the input file.
         #[arg(short, long, default_value = "oracle-general")]
         format: InputFormatArg,
+
+        #[command(flatten)]
+        mooncake: MooncakeArgs,
     },
 
     /// Print statistics about a Parquet trace file.
@@ -51,6 +58,124 @@ enum Command {
         #[arg(short, long)]
         trace: PathBuf,
     },
+}
+
+/// Options for `-f mooncake`.
+#[derive(Args)]
+#[command(next_help_heading = "Mooncake options (-f mooncake)")]
+struct MooncakeArgs {
+    /// Hugging Face repository id, e.g. Qwen/Qwen3-8B. Its config.json is
+    /// downloaded (or read from the local cache) and sizes derived from it.
+    #[arg(long, value_name = "REPO_ID", conflicts_with_all = ["model_config", "kv_bytes_per_token", "model_name"])]
+    model: Option<String>,
+
+    /// Branch, tag or commit of --model.
+    #[arg(long, default_value = "main", requires = "model")]
+    revision: String,
+
+    /// Local Hugging Face config.json of the model; sizes are derived from it.
+    #[arg(long, value_name = "PATH", conflicts_with = "kv_bytes_per_token")]
+    model_config: Option<PathBuf>,
+
+    /// KV bytes per token across all layers, instead of a model config.
+    #[arg(long, value_name = "BYTES")]
+    kv_bytes_per_token: Option<u64>,
+
+    /// Recurrent-state bytes per sequence, with --kv-bytes-per-token.
+    #[arg(long, value_name = "BYTES", requires = "kv_bytes_per_token")]
+    state_bytes: Option<u64>,
+
+    /// Override the config's dtype for KV.
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(DTYPE_NAMES), conflicts_with = "kv_bytes_per_token")]
+    kv_dtype: Option<String>,
+
+    /// Model id recorded in the output metadata, e.g. Qwen/Qwen3-8B.
+    #[arg(long, value_name = "NAME")]
+    model_name: Option<String>,
+
+    /// Tokens per object; must divide the 512-token source block.
+    #[arg(long, default_value_t = 256)]
+    chunk_tokens: u64,
+
+    /// Tensor-parallel degree: one object per rank, 1/N of the bytes (MLA
+    /// models: first rank only, full size).
+    #[arg(long, default_value_t = 1)]
+    tp: u64,
+
+    /// Hybrid models: when a recurrent-state snapshot is stored.
+    #[arg(long, default_value = "per-request")]
+    state_mode: StateModeArg,
+
+    /// Hybrid models: state in the chunk's object or as its own object.
+    #[arg(long, default_value = "combined")]
+    state_layout: StateLayoutArg,
+}
+
+impl MooncakeArgs {
+    fn options(&self) -> Result<MooncakeOptions, Box<dyn std::error::Error>> {
+        let kv_dtype = self.kv_dtype.as_deref();
+        let (sizes, config_sha256, model_name, model_revision) =
+            match (&self.model, &self.model_config, self.kv_bytes_per_token) {
+                (Some(repo), None, None) => {
+                    let bytes = fetch_model_config(repo, &self.revision)?;
+                    (
+                        ModelSizes::from_config_bytes(&bytes, kv_dtype)?,
+                        Some(sha256_hex(&bytes)),
+                        Some(repo.clone()),
+                        Some(self.revision.clone()),
+                    )
+                }
+                (None, Some(path), None) => {
+                    let bytes = std::fs::read(path)
+                        .map_err(|e| format!("model config {}: {e}", path.display()))?;
+                    (
+                        ModelSizes::from_config_bytes(&bytes, kv_dtype)?,
+                        Some(sha256_hex(&bytes)),
+                        self.model_name.clone(),
+                        None,
+                    )
+                }
+                (None, None, Some(kv)) => (
+                    ModelSizes::explicit(kv, self.state_bytes.unwrap_or(0)),
+                    None,
+                    self.model_name.clone(),
+                    None,
+                ),
+                _ => {
+                    return Err(
+                        "-f mooncake needs one of --model, --model-config, --kv-bytes-per-token"
+                            .into(),
+                    )
+                }
+            };
+        Ok(MooncakeOptions {
+            sizes,
+            model_name,
+            model_revision,
+            model_config_sha256: config_sha256,
+            chunk_tokens: self.chunk_tokens,
+            tp: self.tp,
+            state_mode: self.state_mode.into(),
+            state_layout: self.state_layout.into(),
+        })
+    }
+
+    /// Whether any option that only applies to `-f mooncake` was given.
+    fn any_sizes_given(&self) -> bool {
+        self.model.is_some() || self.model_config.is_some() || self.kv_bytes_per_token.is_some()
+    }
+}
+
+#[cfg(feature = "hf-fetch")]
+fn fetch_model_config(repo: &str, revision: &str) -> Result<Vec<u8>, cachesim::Error> {
+    cachesim::hf::fetch_config(repo, revision)
+}
+
+#[cfg(not(feature = "hf-fetch"))]
+fn fetch_model_config(_repo: &str, _revision: &str) -> Result<Vec<u8>, cachesim::Error> {
+    Err(cachesim::Error::Fetch(
+        "--model needs the hf-fetch feature; use --model-config with a local config.json".into(),
+    ))
 }
 
 #[derive(Args)]
@@ -199,6 +324,42 @@ enum InputFormatArg {
     OracleGeneralOpNs,
     /// pelikan-io/cache-trace CSV (optionally zstd-compressed)
     CacheTrace,
+    /// Mooncake trace (JSON lines), expanded into KV-cache objects
+    Mooncake,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StateModeArg {
+    /// One snapshot at each request's last chunk
+    PerRequest,
+    /// A snapshot at every chunk
+    PerChunk,
+}
+
+impl From<StateModeArg> for StateMode {
+    fn from(m: StateModeArg) -> Self {
+        match m {
+            StateModeArg::PerRequest => Self::PerRequest,
+            StateModeArg::PerChunk => Self::PerChunk,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StateLayoutArg {
+    /// State bytes added to the chunk's object
+    Combined,
+    /// State as its own object
+    Separate,
+}
+
+impl From<StateLayoutArg> for StateLayout {
+    fn from(l: StateLayoutArg) -> Self {
+        match l {
+            StateLayoutArg::Combined => Self::Combined,
+            StateLayoutArg::Separate => Self::Separate,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +465,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             input,
             output,
             format,
+            mooncake,
         } => {
+            if !matches!(format, InputFormatArg::Mooncake) && mooncake.any_sizes_given() {
+                return Err(
+                    "--model, --model-config and --kv-bytes-per-token apply only to -f mooncake"
+                        .into(),
+                );
+            }
             eprintln!("Converting {:?} trace …", format);
             let count = match format {
                 InputFormatArg::OracleGeneral => {
@@ -315,6 +483,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 InputFormatArg::CacheTrace => {
                     convert_cache_trace_to_parquet(&input, &output, 65_536)?
+                }
+                InputFormatArg::Mooncake => {
+                    let opts = mooncake.options()?;
+                    eprintln!(
+                        "  KV bytes/token: {}, state bytes/sequence: {}, tp: {}, mla: {}",
+                        opts.sizes.kv_bytes_per_token,
+                        opts.sizes.state_bytes_per_sequence,
+                        opts.tp,
+                        opts.sizes.mla
+                    );
+                    let s = convert_mooncake_to_parquet(&input, &output, &opts, 65_536)?;
+                    eprintln!(
+                        "  {} requests, {} objects, {} size conflicts",
+                        s.requests, s.objects, s.size_conflicts
+                    );
+                    s.rows
                 }
             };
             eprintln!("Converted {count} entries → {}", output.display());

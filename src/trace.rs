@@ -32,6 +32,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 
 use crate::Error;
@@ -346,6 +347,13 @@ impl TraceWriter {
             ttls: Vec::with_capacity(batch_size),
             batch_size,
         })
+    }
+
+    /// Add a key-value pair to the Parquet file footer. Pairs appended any
+    /// time before [`finish`](Self::finish) are written.
+    pub fn append_key_value_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.writer
+            .append_key_value_metadata(KeyValue::new(key.into(), value.into()));
     }
 
     /// Append a single entry (buffered; flushed in batches).
