@@ -22,8 +22,10 @@
 //!   becomes `512 / chunk_tokens` chunks. A chunk's size is its token count
 //!   times the model's KV bytes per token.
 //! * With tensor parallelism each rank stores its own shard as a separate
-//!   object of `1/tp` of the bytes (the key includes the worker id,
-//!   `lmcache/utils.py:389-441`). MLA models are the exception: only the first
+//!   object (the key includes the worker id, `lmcache/utils.py:389-441`).
+//!   A shard is `1/min(tp, kv_heads)` of the KV, since vLLM replicates KV
+//!   heads once `tp` reaches their count, and `1/tp` of the recurrent state;
+//!   see [`MooncakeOptions`]. MLA models are the exception: only the first
 //!   rank stores, and it stores the full latent (`save_only_first_rank`,
 //!   `cache_engine.py:116-119`).
 //!
@@ -63,8 +65,9 @@
 //! per row) and a second map from each distinct object to its size stay in
 //! memory through the second pass, which regenerates the rows and streams
 //! them to the Parquet writer. The input's SHA-256 is checked on both passes,
-//! so a file that changes in between is an error. The output file is created
-//! only after the first pass succeeds and is removed if the second pass fails.
+//! so a file that changes in between is an error. An output that is the input
+//! file is refused. The output is written to a temporary file in its
+//! directory and renamed over it only on success.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -151,6 +154,12 @@ pub struct ModelSizes {
     pub full_attention_layers: Option<u64>,
     /// Linear-attention layer count, when known from a config.
     pub linear_attention_layers: Option<u64>,
+    /// `num_key_value_heads`, when known from a config. Bounds how many ways
+    /// tensor parallelism splits the KV (see [`MooncakeOptions`]).
+    pub kv_heads: Option<u64>,
+    /// `linear_num_value_heads`, when known from a config. Tensor parallelism
+    /// must divide it.
+    pub state_heads: Option<u64>,
 }
 
 impl ModelSizes {
@@ -162,6 +171,8 @@ impl ModelSizes {
             mla: false,
             full_attention_layers: None,
             linear_attention_layers: None,
+            kv_heads: None,
+            state_heads: None,
         }
     }
 
@@ -288,7 +299,16 @@ impl ModelSizes {
                 product(&[full, req_u64(t, "num_key_value_heads")?, head_dim, 2, dt])?
             }
         };
+        let kv_heads = match kv_lora_rank {
+            Some(_) => None,
+            None => Some(req_u64(t, "num_key_value_heads")?),
+        };
 
+        let state_heads = if linear > 0 {
+            Some(req_u64(t, "linear_num_value_heads")?)
+        } else {
+            None
+        };
         let state_bytes_per_sequence = if linear > 0 {
             // Without mamba_ssm_dtype the state takes the model dtype. vLLM
             // v0.31 (db9527a), vllm/model_executor/layers/mamba/mamba_utils.py:98-110:
@@ -319,6 +339,8 @@ impl ModelSizes {
             mla: kv_lora_rank.is_some(),
             full_attention_layers: Some(full),
             linear_attention_layers: Some(linear),
+            kv_heads,
+            state_heads,
         })
     }
 }
@@ -394,6 +416,27 @@ impl StateLayout {
 }
 
 /// Settings for [`convert_mooncake_to_parquet`].
+///
+/// # Tensor parallelism
+///
+/// Each of the `tp` ranks stores its own object per chunk. A rank's share of
+/// the KV follows vLLM v0.31 (db9527a), which splits KV heads across ranks
+/// and replicates them once `tp` reaches the head count
+/// (`vllm/model_executor/layers/linear.py:1053-1058`, QKVParallelLinear;
+/// `vllm/config/model.py:1625-1628`, `get_num_kv_heads`): with `h` KV heads a
+/// rank holds `1/min(tp, h)` of the KV. vLLM requires `h % tp == 0` when
+/// `tp < h` and `tp % h == 0` otherwise; other values are an error here too.
+/// Without a head count (`--kv-bytes-per-token`) the share is `1/tp`.
+///
+/// The recurrent state is split by linear-attention value heads, and vLLM
+/// requires `tp` to divide their count (`divide(num_v_heads, tp_world_size)`,
+/// `vllm/model_executor/layers/mamba/mamba_utils.py:295-299`), so a rank
+/// holds `1/tp` of the state and a `tp` that does not divide the count is an
+/// error. Qwen3.8-27B: 48 value heads, 6 per rank at `tp` 8.
+///
+/// Per-rank sizes must be whole bytes: a KV size per token or a state size
+/// that the divisor does not divide is an error rather than rounded. MLA
+/// models are stored by the first rank only, at full size.
 #[derive(Debug, Clone)]
 pub struct MooncakeOptions {
     pub sizes: ModelSizes,
@@ -448,6 +491,74 @@ impl MooncakeOptions {
         }
         Ok(())
     }
+
+    /// Objects per chunk and the per-rank sizes; see [the type
+    /// docs](Self#tensor-parallelism).
+    fn sharding(&self) -> Result<Sharding, Error> {
+        self.validate()?;
+        let tp = self.tp;
+        let s = &self.sizes;
+        let tp_err = |msg: String| Error::InvalidFormat(format!("mooncake: tp {tp}: {msg}"));
+        if s.mla {
+            return Ok(Sharding {
+                ranks: 1,
+                kv_div: 1,
+                state_div: 1,
+                kv_per_token: s.kv_bytes_per_token,
+                state: s.state_bytes_per_sequence,
+            });
+        }
+        let kv_div = match s.kv_heads {
+            Some(0) => return Err(tp_err("num_key_value_heads is 0".into())),
+            Some(h) if tp >= h && !tp.is_multiple_of(h) => {
+                return Err(tp_err(format!("not a multiple of the {h} KV heads")))
+            }
+            Some(h) if tp < h && !h.is_multiple_of(tp) => {
+                return Err(tp_err(format!("does not divide the {h} KV heads")))
+            }
+            Some(h) => tp.min(h),
+            None => tp,
+        };
+        let state = s.state_bytes_per_sequence;
+        if let Some(h) = s.state_heads.filter(|_| state > 0) {
+            if !h.is_multiple_of(tp) {
+                return Err(tp_err(format!(
+                    "does not divide the {h} linear-attention value heads"
+                )));
+            }
+        }
+        let state_div = tp;
+        if !s.kv_bytes_per_token.is_multiple_of(kv_div) {
+            return Err(tp_err(format!(
+                "{} KV bytes per token do not split evenly {kv_div} ways",
+                s.kv_bytes_per_token
+            )));
+        }
+        if !state.is_multiple_of(state_div) {
+            return Err(tp_err(format!(
+                "{state} state bytes do not split evenly {state_div} ways"
+            )));
+        }
+        Ok(Sharding {
+            ranks: tp,
+            kv_div,
+            state_div,
+            kv_per_token: s.kv_bytes_per_token / kv_div,
+            state: state / state_div,
+        })
+    }
+}
+
+/// How one chunk's bytes are spread over tensor-parallel ranks.
+struct Sharding {
+    /// Objects per chunk (one per storing rank).
+    ranks: u64,
+    kv_div: u64,
+    state_div: u64,
+    /// KV bytes per token held by one rank.
+    kv_per_token: u64,
+    /// Recurrent-state bytes per sequence held by one rank.
+    state: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -470,9 +581,22 @@ struct Request {
 fn parse_request(line: &str, lineno: usize) -> Result<Request, Error> {
     let r: MooncakeRecord = serde_json::from_str(line)
         .map_err(|e| Error::InvalidFormat(format!("mooncake line {lineno}: {e}")))?;
+    if r.input_length < 0 {
+        return Err(Error::InvalidFormat(format!(
+            "mooncake line {lineno}: negative input_length {}",
+            r.input_length
+        )));
+    }
     let n = r.hash_ids.len() as i64;
     let block = SOURCE_BLOCK_TOKENS as i64;
-    let last = (r.input_length - block * (n - 1)).clamp(1, block) as u64;
+    let full_blocks = n.saturating_sub(1);
+    let last = block
+        .checked_mul(full_blocks)
+        .and_then(|full| r.input_length.checked_sub(full))
+        .ok_or_else(|| {
+            Error::InvalidFormat(format!("mooncake line {lineno}: block count out of range"))
+        })?
+        .clamp(1, block) as u64;
     let blocks = r
         .hash_ids
         .iter()
@@ -499,13 +623,13 @@ fn parse_request(line: &str, lineno: usize) -> Result<Request, Error> {
 fn expand_request(
     req: &Request,
     opts: &MooncakeOptions,
+    shard: &Sharding,
     mut emit: impl FnMut(u64, u64) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let per_block = SOURCE_BLOCK_TOKENS / opts.chunk_tokens;
-    let kvt = opts.sizes.kv_bytes_per_token;
-    let state = opts.sizes.state_bytes_per_sequence;
-    // MLA: only the first rank stores, and it stores the whole latent.
-    let ranks = if opts.sizes.mla { 1 } else { opts.tp };
+    let kvt = shard.kv_per_token;
+    let state = shard.state;
+    let ranks = shard.ranks;
 
     let mut chunks = Vec::new();
     for &(block, tokens) in &req.blocks {
@@ -520,7 +644,7 @@ fn expand_request(
 
     let n = chunks.len();
     for (i, &(block, c, ctok)) in chunks.iter().enumerate() {
-        let snap = state > 0
+        let snap = opts.sizes.state_bytes_per_sequence > 0
             && match opts.state_mode {
                 StateMode::PerChunk => true,
                 StateMode::PerRequest => i == n - 1,
@@ -536,11 +660,11 @@ fn expand_request(
             (KIND_KV, kv)
         };
         for rank in 0..ranks {
-            emit(obj_id(block, c, kind, rank)?, bytes / ranks)?;
+            emit(obj_id(block, c, kind, rank)?, bytes)?;
         }
         if snap && !combined {
             for rank in 0..ranks {
-                emit(obj_id(block, c, KIND_STATE, rank)?, state / ranks)?;
+                emit(obj_id(block, c, KIND_STATE, rank)?, state)?;
             }
         }
     }
@@ -625,26 +749,42 @@ pub fn convert_mooncake_to_parquet(
     opts: &MooncakeOptions,
     batch_size: usize,
 ) -> Result<MooncakeSummary, Error> {
-    opts.validate()?;
+    let shard = opts.sharding()?;
     let input = input.as_ref();
     let output = output.as_ref();
     // One handle, rewound for the second pass, so a redirected /dev/stdin
     // that is a regular file reads the same bytes twice.
-    let mut file = File::open(input)?;
-    if !file.metadata()?.is_file() {
-        return Err(Error::InvalidFormat(format!(
-            "mooncake: {} is not a regular file; the converter reads its input twice, \
-             so pipes are not supported",
-            input.display()
-        )));
+    // Checked by path first because opening a directory fails on Windows.
+    let not_regular = |meta: &std::fs::Metadata| {
+        Error::InvalidFormat(format!(
+            "mooncake: {} is {}, not a regular file; the converter reads its input twice",
+            input.display(),
+            describe_file_type(meta)
+        ))
+    };
+    if let Ok(meta) = std::fs::metadata(input) {
+        if meta.is_dir() {
+            return Err(not_regular(&meta));
+        }
     }
-    if input
-        .extension()
-        .is_some_and(|e| e == "zst" || e == "zstd" || e == "gz")
-    {
+    let mut file = File::open(input)?;
+    let input_meta = file.metadata()?;
+    if !input_meta.is_file() {
+        return Err(not_regular(&input_meta));
+    }
+    if input.extension().is_some_and(|e| {
+        let e = e.to_string_lossy().to_ascii_lowercase();
+        e == "zst" || e == "zstd" || e == "gz"
+    }) {
         return Err(Error::InvalidFormat(format!(
             "mooncake: {} looks compressed; decompress it first",
             input.display()
+        )));
+    }
+    if same_file(input, &input_meta, output) {
+        return Err(Error::InvalidFormat(format!(
+            "mooncake: output {} is the input file",
+            output.display()
         )));
     }
     let created = utc_now_iso8601();
@@ -656,7 +796,7 @@ pub fn convert_mooncake_to_parquet(
     let mut requests = 0usize;
     let sha256 = for_each_request(&mut file, |req| {
         requests += 1;
-        expand_request(req, opts, |id, size| {
+        expand_request(req, opts, &shard, |id, size| {
             let size = u32::try_from(size).map_err(|_| {
                 Error::InvalidFormat(format!(
                     "mooncake: an object of {size} bytes exceeds the obj_size column's u32 range"
@@ -716,6 +856,8 @@ pub fn convert_mooncake_to_parquet(
         ),
         ("kvtrace.chunk_tokens", opts.chunk_tokens.to_string()),
         ("kvtrace.tp", opts.tp.to_string()),
+        ("kvtrace.kv_tp_divisor", shard.kv_div.to_string()),
+        ("kvtrace.state_tp_divisor", shard.state_div.to_string()),
         (
             "kvtrace.state_mode",
             if state > 0 {
@@ -762,16 +904,35 @@ pub fn convert_mooncake_to_parquet(
         metadata.push(("kvtrace.model.config_sha256", sha.clone()));
     }
 
-    // Pass 2: regenerate the rows and stream them out. A failure removes the
-    // partial output.
+    // Pass 2: regenerate the rows and stream them out. A regular (or new)
+    // output is written to a temporary file in the same directory and renamed
+    // over the output on success, so a failure leaves any existing output
+    // untouched and removes only the temporary file. A device such as
+    // /dev/null is written directly.
+    let direct = std::fs::metadata(output).is_ok_and(|m| !m.is_file());
+    let target = if direct {
+        output.to_path_buf()
+    } else {
+        let name = output.file_name().ok_or_else(|| {
+            Error::InvalidFormat(format!(
+                "mooncake: output {} has no file name",
+                output.display()
+            ))
+        })?;
+        output.with_file_name(format!(
+            ".{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        ))
+    };
     let pass2 = || -> Result<(), Error> {
-        let mut writer = TraceWriter::create(output, batch_size)?;
+        let mut writer = TraceWriter::create(&target, batch_size)?;
         for (k, v) in metadata {
             writer.append_key_value_metadata(k, v);
         }
         let mut row = 0usize;
         let sha256_again = for_each_request(&mut file, |req| {
-            expand_request(req, opts, |id, _| {
+            expand_request(req, opts, &shard, |id, _| {
                 let (size, next) = match (first_size.get(&id), next_access.get(row)) {
                     (Some(&s), Some(&n)) => (s, n as i64),
                     _ => return Err(changed_input()),
@@ -793,8 +954,17 @@ pub fn convert_mooncake_to_parquet(
         }
         writer.finish()
     };
-    if let Err(e) = pass2() {
-        let _ = std::fs::remove_file(output);
+    let result = pass2().and_then(|()| {
+        if direct {
+            Ok(())
+        } else {
+            std::fs::rename(&target, output).map_err(Error::from)
+        }
+    });
+    if let Err(e) = result {
+        if !direct {
+            let _ = std::fs::remove_file(&target);
+        }
         return Err(e);
     }
 
@@ -804,6 +974,49 @@ pub fn convert_mooncake_to_parquet(
         objects: first_size.len(),
         size_conflicts,
     })
+}
+
+/// "a directory", "a pipe", ... for an error message.
+fn describe_file_type(meta: &std::fs::Metadata) -> &'static str {
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        return "a directory";
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_fifo() {
+            return "a pipe";
+        }
+        if ft.is_socket() {
+            return "a socket";
+        }
+        if ft.is_char_device() || ft.is_block_device() {
+            return "a device";
+        }
+    }
+    "not a regular file"
+}
+
+/// Whether `output` names the input file: the same path after resolving
+/// symlinks, or (on Unix) the same device and inode, which also catches hard
+/// links.
+fn same_file(input: &Path, input_meta: &std::fs::Metadata, output: &Path) -> bool {
+    let Ok(out_meta) = std::fs::metadata(output) else {
+        return false; // the output does not exist yet
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if input_meta.dev() == out_meta.dev() && input_meta.ino() == out_meta.ino() {
+            return true;
+        }
+    }
+    let _ = (input_meta, out_meta);
+    matches!(
+        (std::fs::canonicalize(input), std::fs::canonicalize(output)),
+        (Ok(a), Ok(b)) if a == b
+    )
 }
 
 fn changed_input() -> Error {
@@ -1014,13 +1227,15 @@ mod tests {
         let err = convert_mooncake_to_parquet(dir.path(), &out, &opts, 4)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not a regular file"), "{err}");
-        let zst = dir.path().join("trace.jsonl.zst");
-        std::fs::write(&zst, b"").unwrap();
-        let err = convert_mooncake_to_parquet(&zst, &out, &opts, 4)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("decompress"), "{err}");
+        assert!(err.contains("is a directory"), "{err}");
+        for name in ["trace.jsonl.zst", "trace.jsonl.ZST", "trace.jsonl.Gz"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"").unwrap();
+            let err = convert_mooncake_to_parquet(&path, &out, &opts, 4)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("decompress"), "{name}: {err}");
+        }
         assert!(!out.exists());
     }
 
@@ -1040,10 +1255,16 @@ mod tests {
 
     fn expand(line: &str, opts: &MooncakeOptions) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
-        expand_request(&parse_request(line, 1).unwrap(), opts, |id, size| {
-            out.push((id, size));
-            Ok(())
-        })
+        let shard = opts.sharding().unwrap();
+        expand_request(
+            &parse_request(line, 1).unwrap(),
+            opts,
+            &shard,
+            |id, size| {
+                out.push((id, size));
+                Ok(())
+            },
+        )
         .unwrap();
         out
     }
@@ -1085,15 +1306,186 @@ mod tests {
 
     #[test]
     fn tp_split_and_mla_first_rank() {
-        let mut opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+        let mut opts = MooncakeOptions::new(ModelSizes::explicit(12, 0));
         opts.tp = 4;
         let line = r#"{"timestamp": 0, "input_length": 100, "hash_ids": [7]}"#;
         assert_eq!(
             expand(line, &opts),
-            (0..4).map(|r| (id(7, 0, 0, r), 250)).collect::<Vec<_>>()
+            (0..4).map(|r| (id(7, 0, 0, r), 300)).collect::<Vec<_>>()
         );
         opts.sizes.mla = true;
-        assert_eq!(expand(line, &opts), [(id(7, 0, 0, 0), 1000)]);
+        assert_eq!(expand(line, &opts), [(id(7, 0, 0, 0), 1200)]);
+    }
+
+    fn qwen3_8_27b(tp: u64) -> MooncakeOptions {
+        let sizes = ModelSizes::from_config_file(fixture("qwen3.8-27b.json"), None).unwrap();
+        let mut opts = MooncakeOptions::new(sizes);
+        opts.tp = tp;
+        opts
+    }
+
+    #[test]
+    fn tp_above_kv_heads_replicates_kv() {
+        // 4 KV heads, 48 linear value heads. At tp 8 each rank holds 1/4 of the
+        // KV (heads replicated) and 1/8 of the state.
+        let opts = qwen3_8_27b(8);
+        let shard = opts.sharding().unwrap();
+        assert_eq!((shard.ranks, shard.kv_div, shard.state_div), (8, 4, 8));
+        assert_eq!(shard.kv_per_token, 16_384);
+        assert_eq!(shard.state, 18_874_368);
+        let line = r#"{"timestamp": 0, "input_length": 1024, "hash_ids": [1, 2]}"#;
+        let rows = expand(line, &opts);
+        assert_eq!(rows.len(), 4 * 8);
+        // KV-only chunk: 256 x 16,384; last chunk adds the state share.
+        assert!(rows[..24].iter().all(|&(_, size)| size == 4_194_304));
+        assert!(rows[24..]
+            .iter()
+            .all(|&(_, size)| size == 4_194_304 + 18_874_368));
+
+        // tp 2 is below the head count: plain 1/tp.
+        let shard = qwen3_8_27b(2).sharding().unwrap();
+        assert_eq!((shard.kv_div, shard.state_div), (2, 2));
+
+        // Qwen3-8B (8 KV heads) at tp 16.
+        let sizes = ModelSizes::from_config_file(fixture("qwen3-8b.json"), None).unwrap();
+        let mut opts = MooncakeOptions::new(sizes);
+        opts.tp = 16;
+        let shard = opts.sharding().unwrap();
+        assert_eq!((shard.kv_div, shard.kv_per_token), (8, 147_456 / 8));
+    }
+
+    #[test]
+    fn tp_that_does_not_split_evenly_is_an_error() {
+        // 4 KV heads: 3 does not divide them, 6 is not a multiple of them.
+        for tp in [3, 6] {
+            let err = qwen3_8_27b(tp).sharding().err().unwrap().to_string();
+            assert!(err.contains("KV heads"), "tp {tp}: {err}");
+        }
+        // 48 value heads: 32 is a multiple of the 4 KV heads but does not divide 48.
+        let err = qwen3_8_27b(32).sharding().err().unwrap().to_string();
+        assert!(err.contains("value heads"), "{err}");
+
+        // Explicit sizes: per-rank bytes must be whole.
+        let mut opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+        opts.tp = 4;
+        assert!(opts
+            .sharding()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("KV bytes"));
+        let mut opts = MooncakeOptions::new(ModelSizes::explicit(10, 1001));
+        opts.tp = 2;
+        assert!(opts
+            .sharding()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("state bytes"));
+    }
+
+    #[test]
+    fn input_length_is_validated() {
+        let err = parse_request(
+            r#"{"timestamp": 0, "input_length": -9223372036854775808, "hash_ids": [1, 2]}"#,
+            3,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("line 3") && err.contains("negative input_length"),
+            "{err}"
+        );
+        // No ids: no blocks, whatever the length.
+        let r = parse_request(r#"{"timestamp": 0, "input_length": 0, "hash_ids": []}"#, 1);
+        assert!(r.unwrap().blocks.is_empty());
+    }
+
+    #[test]
+    fn output_never_overwrites_the_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("trace.jsonl");
+        std::fs::copy(fixture("trace.jsonl"), &input).unwrap();
+        let before = std::fs::read(&input).unwrap();
+        let opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+
+        let mut outputs = vec![input.clone(), dir.path().join(".").join("trace.jsonl")];
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.parquet");
+            std::os::unix::fs::symlink(&input, &link).unwrap();
+            let hard = dir.path().join("hard.parquet");
+            std::fs::hard_link(&input, &hard).unwrap();
+            outputs.extend([link, hard]);
+        }
+        for out in outputs {
+            let err = convert_mooncake_to_parquet(&input, &out, &opts, 4)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                err.contains("is the input file"),
+                "{}: {err}",
+                out.display()
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn output_is_replaced_only_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.parquet");
+        std::fs::write(&out, b"keep").unwrap();
+
+        // A failing run leaves the existing output and no temporary file.
+        let bad = MooncakeOptions::new(ModelSizes::explicit(u64::MAX, 0));
+        assert!(convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &bad, 4).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep");
+
+        // A successful run replaces it, even when it is read-only (Unix):
+        // the new file is renamed over it rather than opened for writing.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+        convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &opts, 4).unwrap();
+        assert_eq!(TraceReader::open(&out).unwrap().total_entries(), 13);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["out.parquet"]);
+    }
+
+    /// The writer cannot create its temporary file: the existing (read-only)
+    /// output must survive.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_output_directory_keeps_existing_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("out");
+        std::fs::create_dir(&sub).unwrap();
+        let out = sub.join("out.parquet");
+        std::fs::write(&out, b"keep").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the permissions; nothing to test then.
+        let probe = sub.join("probe");
+        if File::create(&probe).is_ok() {
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+        let result = convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &opts, 4);
+        let kept = std::fs::read(&out).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(kept, b"keep");
     }
 
     #[test]
@@ -1241,7 +1633,9 @@ mod tests {
             assert_eq!(meta.get(k).map(String::as_str), Some(v), "{k}");
         }
         assert!(meta["kvtrace.created"].ends_with("+00:00"));
-        assert_eq!(meta.len(), 20);
+        assert_eq!(meta["kvtrace.kv_tp_divisor"], "1");
+        assert_eq!(meta["kvtrace.state_tp_divisor"], "1");
+        assert_eq!(meta.len(), 22);
     }
 
     #[test]

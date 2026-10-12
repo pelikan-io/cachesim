@@ -143,8 +143,19 @@ Objects (defaults follow LMCache v0.5.5):
 - One object is one chunk of `--chunk-tokens` tokens (default 256) of a
   block, across all layers. Its size is tokens × KV bytes per token.
 - `--tp N`: each tensor-parallel rank stores its own shard, so each chunk is
-  N objects of 1/N of the bytes. MLA models (`kv_lora_rank` in the config)
-  are stored by the first rank only, at full size.
+  N objects. A rank's KV share follows vLLM v0.31 (db9527a), which splits
+  KV heads across ranks and replicates them once N reaches the head count
+  (`vllm/model_executor/layers/linear.py:1053-1058`,
+  `vllm/config/model.py:1625-1628`): with `h = num_key_value_heads` a rank
+  holds 1/min(N, h) of the KV. vLLM requires `h % N == 0` when `N < h` and
+  `N % h == 0` otherwise, and so does the converter. With
+  `--kv-bytes-per-token` there is no head count and the share is 1/N. The
+  recurrent state is split by linear-attention value heads, which N must
+  divide (`vllm/model_executor/layers/mamba/mamba_utils.py:295-299`), so a
+  rank holds 1/N of it. A per-rank size that is not a whole number of bytes
+  is an error, not rounded. MLA models (`kv_lora_rank` in the config) are
+  stored by the first rank only, at full size. The divisors are recorded as
+  `kvtrace.kv_tp_divisor` and `kvtrace.state_tp_divisor`.
 - Hybrid models (linear-attention layers with a recurrent state):
   `--state-mode per-request` (default) stores one state snapshot at each
   request's last chunk; `per-chunk` stores one at every chunk.
@@ -220,14 +231,18 @@ SHA-256, derived sizes and layer counts, chunk size, TP degree, state mode and
 layout, request count, size-conflict count, and the `obj_id` layout.
 
 The converter reads the input twice, so the input must be an uncompressed
-regular file: pipes (including a piped `/dev/stdin`) and `.zst`/`.gz`
-files are rejected (decompress first). The first pass builds the `obj_id` column (8 bytes per
+regular file: directories, pipes (including a piped `/dev/stdin`) and
+`.zst`/`.zstd`/`.gz` files (any letter case) are rejected; decompress first. The first pass builds the `obj_id` column (8 bytes per
 row), which a reverse scan overwrites in place with `next_access_vtime`; the
 scan's map of distinct objects is then freed. That column and a map from
 each distinct object to its size stay in memory through the second pass,
 which regenerates the rows and streams them to the writer. The input's
-SHA-256 must match across the two passes. The output file is created only
-after the first pass succeeds and is removed if the second pass fails.
+SHA-256 must match across the two passes. An output that is the input file
+(same path, a symlink to it, or a hard link) is refused. The output is
+written to a temporary file `.<name>.<pid>.tmp` in the output's directory
+and renamed over the output only on success, so a failed run leaves an
+existing output unchanged; an output that is a device such as `/dev/null`
+is written directly.
 
 ## Code Architecture
 
@@ -333,7 +348,9 @@ cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
 cachesim convert -i conversation_trace.jsonl -o conv.parquet -f mooncake \
     --model Qwen/Qwen3-8B
 
-# Hybrid model, tensor parallel 8, offline with a local config.json
+# Hybrid model, tensor parallel 8, offline with a local config.json.
+# Qwen3.8-27B has 4 KV heads, so each of the 8 ranks holds 1/4 of the KV
+# (16,384 B/token) and 1/8 of the recurrent state (18,874,368 B).
 cachesim convert -i conversation_trace.jsonl -o conv-tp8.parquet -f mooncake \
     --model-config config.json --model-name Qwen/Qwen3.8-27B --tp 8 \
     --state-mode per-request --state-layout combined
