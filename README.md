@@ -152,10 +152,15 @@ Objects (defaults follow LMCache v0.5.5):
   `--kv-bytes-per-token` there is no head count and the share is 1/N. The
   recurrent state is split by linear-attention value heads, which N must
   divide (`vllm/model_executor/layers/mamba/mamba_utils.py:295-299`), so a
-  rank holds 1/N of it. A per-rank size that is not a whole number of bytes
+  rank holds 1/N of it. N must also divide `num_attention_heads`
+  (`linear.py:1052`) and, for hybrid models, the linear-attention
+  convolution width `2 × linear_num_key_heads × linear_key_head_dim +
+  linear_num_value_heads × linear_value_head_dim` (`mamba_utils.py:289-293`),
+  as vLLM requires. A per-rank size that is not a whole number of bytes
   is an error, not rounded. MLA models (`kv_lora_rank` in the config) are
   stored by the first rank only, at full size. The divisors are recorded as
-  `kvtrace.kv_tp_divisor` and `kvtrace.state_tp_divisor`.
+  `kvtrace.kv_tp_divisor` and `kvtrace.state_tp_divisor` (`none` for a
+  model without recurrent state).
 - Hybrid models (linear-attention layers with a recurrent state):
   `--state-mode per-request` (default) stores one state snapshot at each
   request's last chunk; `per-chunk` stores one at every chunk.
@@ -237,12 +242,22 @@ row), which a reverse scan overwrites in place with `next_access_vtime`; the
 scan's map of distinct objects is then freed. That column and a map from
 each distinct object to its size stay in memory through the second pass,
 which regenerates the rows and streams them to the writer. The input's
-SHA-256 must match across the two passes. An output that is the input file
-(same path, a symlink to it, or a hard link) is refused. The output is
-written to a temporary file `.<name>.<pid>.tmp` in the output's directory
-and renamed over the output only on success, so a failed run leaves an
-existing output unchanged; an output that is a device such as `/dev/null`
-is written directly.
+SHA-256 must match across the two passes.
+
+Output handling, all checked before the first pass:
+
+- An output that is the input file (same path, a symlink to it, or a hard
+  link), a directory, or an existing read-only file is refused.
+- An output that is a symlink is followed: the result is written to the file
+  it links to, and the link is kept. A dangling symlink is refused.
+- A device or pipe such as `/dev/null` is written directly.
+- Otherwise the result is written to `.<name>.<pid>.<n>.tmp` in the
+  destination's directory, flushed to disk, and renamed over the destination
+  only on success. An ordinary error removes the temporary file and leaves
+  an existing output unchanged; a killed run leaves the temporary file
+  behind, to be deleted by hand.
+- On Windows the final rename can fail if another process has the
+  destination open.
 
 ## Code Architecture
 

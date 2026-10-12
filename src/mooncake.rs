@@ -65,9 +65,8 @@
 //! per row) and a second map from each distinct object to its size stay in
 //! memory through the second pass, which regenerates the rows and streams
 //! them to the Parquet writer. The input's SHA-256 is checked on both passes,
-//! so a file that changes in between is an error. An output that is the input
-//! file is refused. The output is written to a temporary file in its
-//! directory and renamed over it only on success.
+//! so a file that changes in between is an error. Output handling (refusals,
+//! symlinks, the temporary file) is described on `plan_output`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -160,6 +159,14 @@ pub struct ModelSizes {
     /// `linear_num_value_heads`, when known from a config. Tensor parallelism
     /// must divide it.
     pub state_heads: Option<u64>,
+    /// `num_attention_heads`, when known from a config. Tensor parallelism
+    /// must divide it.
+    pub attention_heads: Option<u64>,
+    /// Width of the linear-attention convolution input,
+    /// `2 × linear_num_key_heads × linear_key_head_dim +
+    /// linear_num_value_heads × linear_value_head_dim`, when known from a
+    /// config. Tensor parallelism must divide it.
+    pub state_conv_dim: Option<u64>,
 }
 
 impl ModelSizes {
@@ -173,6 +180,8 @@ impl ModelSizes {
             linear_attention_layers: None,
             kv_heads: None,
             state_heads: None,
+            attention_heads: None,
+            state_conv_dim: None,
         }
     }
 
@@ -304,10 +313,19 @@ impl ModelSizes {
             None => Some(req_u64(t, "num_key_value_heads")?),
         };
 
-        let state_heads = if linear > 0 {
-            Some(req_u64(t, "linear_num_value_heads")?)
+        let attention_heads = opt_u64(t, "num_attention_heads")?;
+        let (state_heads, state_conv_dim) = if linear > 0 {
+            let v_heads = req_u64(t, "linear_num_value_heads")?;
+            let k_part = product(&[
+                2,
+                req_u64(t, "linear_num_key_heads")?,
+                req_u64(t, "linear_key_head_dim")?,
+            ])?;
+            let v_part = product(&[v_heads, req_u64(t, "linear_value_head_dim")?])?;
+            let conv_dim = k_part.checked_add(v_part).ok_or_else(overflow)?;
+            (Some(v_heads), Some(conv_dim))
         } else {
-            None
+            (None, None)
         };
         let state_bytes_per_sequence = if linear > 0 {
             // Without mamba_ssm_dtype the state takes the model dtype. vLLM
@@ -341,6 +359,8 @@ impl ModelSizes {
             linear_attention_layers: Some(linear),
             kv_heads,
             state_heads,
+            attention_heads,
+            state_conv_dim,
         })
     }
 }
@@ -434,6 +454,11 @@ impl StateLayout {
 /// holds `1/tp` of the state and a `tp` that does not divide the count is an
 /// error. Qwen3.8-27B: 48 value heads, 6 per rank at `tp` 8.
 ///
+/// vLLM also requires `tp` to divide `num_attention_heads`
+/// (`vllm/model_executor/layers/linear.py:1052`) and the linear-attention
+/// convolution width (`mamba_utils.py:289-293`); both are checked when the
+/// config gives them.
+///
 /// Per-rank sizes must be whole bytes: a KV size per token or a state size
 /// that the divisor does not divide is an error rather than rounded. MLA
 /// models are stored by the first rank only, at full size.
@@ -499,15 +524,8 @@ impl MooncakeOptions {
         let tp = self.tp;
         let s = &self.sizes;
         let tp_err = |msg: String| Error::InvalidFormat(format!("mooncake: tp {tp}: {msg}"));
-        if s.mla {
-            return Ok(Sharding {
-                ranks: 1,
-                kv_div: 1,
-                state_div: 1,
-                kv_per_token: s.kv_bytes_per_token,
-                state: s.state_bytes_per_sequence,
-            });
-        }
+
+        // Head counts vLLM requires tp to fit (see the type docs).
         let kv_div = match s.kv_heads {
             Some(0) => return Err(tp_err("num_key_value_heads is 0".into())),
             Some(h) if tp >= h && !tp.is_multiple_of(h) => {
@@ -526,6 +544,34 @@ impl MooncakeOptions {
                     "does not divide the {h} linear-attention value heads"
                 )));
             }
+        }
+        // vLLM also splits the attention heads evenly
+        // (`self.num_heads = divide(self.total_num_heads, tp_size)`,
+        // vllm/model_executor/layers/linear.py:1052) and the linear-attention
+        // convolution input (`divide(conv_dim, tp_world_size)`,
+        // vllm/model_executor/layers/mamba/mamba_utils.py:289-293).
+        if let Some(h) = s.attention_heads {
+            if h == 0 || !h.is_multiple_of(tp) {
+                return Err(tp_err(format!("does not divide the {h} attention heads")));
+            }
+        }
+        if let Some(d) = s.state_conv_dim.filter(|_| state > 0) {
+            if d == 0 || !d.is_multiple_of(tp) {
+                return Err(tp_err(format!(
+                    "does not divide the linear-attention convolution width {d}"
+                )));
+            }
+        }
+
+        if s.mla {
+            // Only the first rank stores, and it stores the whole latent.
+            return Ok(Sharding {
+                ranks: 1,
+                kv_div: 1,
+                state_div: 1,
+                kv_per_token: s.kv_bytes_per_token,
+                state,
+            });
         }
         let state_div = tp;
         if !s.kv_bytes_per_token.is_multiple_of(kv_div) {
@@ -781,12 +827,7 @@ pub fn convert_mooncake_to_parquet(
             input.display()
         )));
     }
-    if same_file(input, &input_meta, output) {
-        return Err(Error::InvalidFormat(format!(
-            "mooncake: output {} is the input file",
-            output.display()
-        )));
-    }
+    let out = plan_output(input, &input_meta, output)?;
     let created = utc_now_iso8601();
 
     // Pass 1: object ids and the first size of each.
@@ -857,7 +898,14 @@ pub fn convert_mooncake_to_parquet(
         ("kvtrace.chunk_tokens", opts.chunk_tokens.to_string()),
         ("kvtrace.tp", opts.tp.to_string()),
         ("kvtrace.kv_tp_divisor", shard.kv_div.to_string()),
-        ("kvtrace.state_tp_divisor", shard.state_div.to_string()),
+        (
+            "kvtrace.state_tp_divisor",
+            if state > 0 {
+                shard.state_div.to_string()
+            } else {
+                "none".to_string()
+            },
+        ),
         (
             "kvtrace.state_mode",
             if state > 0 {
@@ -904,29 +952,11 @@ pub fn convert_mooncake_to_parquet(
         metadata.push(("kvtrace.model.config_sha256", sha.clone()));
     }
 
-    // Pass 2: regenerate the rows and stream them out. A regular (or new)
-    // output is written to a temporary file in the same directory and renamed
-    // over the output on success, so a failure leaves any existing output
-    // untouched and removes only the temporary file. A device such as
-    // /dev/null is written directly.
-    let direct = std::fs::metadata(output).is_ok_and(|m| !m.is_file());
-    let target = if direct {
-        output.to_path_buf()
-    } else {
-        let name = output.file_name().ok_or_else(|| {
-            Error::InvalidFormat(format!(
-                "mooncake: output {} has no file name",
-                output.display()
-            ))
-        })?;
-        output.with_file_name(format!(
-            ".{}.{}.tmp",
-            name.to_string_lossy(),
-            std::process::id()
-        ))
-    };
+    // Pass 2: regenerate the rows and stream them out to the file chosen by
+    // plan_output().
+    let target = out.temp.as_deref().unwrap_or(&out.dest);
     let pass2 = || -> Result<(), Error> {
-        let mut writer = TraceWriter::create(&target, batch_size)?;
+        let mut writer = TraceWriter::create(target, batch_size)?;
         for (k, v) in metadata {
             writer.append_key_value_metadata(k, v);
         }
@@ -952,18 +982,19 @@ pub fn convert_mooncake_to_parquet(
         if sha256_again != sha256 || row != rows {
             return Err(changed_input());
         }
-        writer.finish()
-    };
-    let result = pass2().and_then(|()| {
-        if direct {
-            Ok(())
+        if out.temp.is_some() {
+            writer.finish_synced()
         } else {
-            std::fs::rename(&target, output).map_err(Error::from)
+            writer.finish()
         }
+    };
+    let result = pass2().and_then(|()| match &out.temp {
+        Some(temp) => std::fs::rename(temp, &out.dest).map_err(Error::from),
+        None => Ok(()),
     });
     if let Err(e) = result {
-        if !direct {
-            let _ = std::fs::remove_file(&target);
+        if let Some(temp) = &out.temp {
+            let _ = std::fs::remove_file(temp);
         }
         return Err(e);
     }
@@ -996,6 +1027,63 @@ fn describe_file_type(meta: &std::fs::Metadata) -> &'static str {
         }
     }
     "not a regular file"
+}
+
+/// Where pass 2 writes.
+struct OutputPlan {
+    /// The file the result ends up in: the output path, or the file it links to.
+    dest: std::path::PathBuf,
+    /// Temporary file in `dest`'s directory, renamed over `dest` on success;
+    /// `None` when `dest` is a device or pipe that is written directly.
+    temp: Option<std::path::PathBuf>,
+}
+
+/// Distinguishes temporary files of concurrent conversions in one process.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Decide where the output is written, refusing outputs that must not be
+/// replaced, before any work is done.
+///
+/// * A symlink is followed: the result is written to the file it links to,
+///   as writing through the link would. A dangling link is an error.
+/// * The input file, a directory, or an existing read-only file is an error.
+/// * A device or pipe (e.g. `/dev/null`) is written directly.
+/// * Otherwise the result goes to `.<name>.<pid>.<n>.tmp` beside the
+///   destination and is renamed over it on success.
+fn plan_output(
+    input: &Path,
+    input_meta: &std::fs::Metadata,
+    output: &Path,
+) -> Result<OutputPlan, Error> {
+    let refuse =
+        |what: &str| Error::InvalidFormat(format!("mooncake: output {} {what}", output.display()));
+    let is_link = std::fs::symlink_metadata(output).is_ok_and(|m| m.file_type().is_symlink());
+    let dest = if is_link {
+        std::fs::canonicalize(output)
+            .map_err(|e| refuse(&format!("is a symlink that cannot be resolved: {e}")))?
+    } else {
+        output.to_path_buf()
+    };
+    if same_file(input, input_meta, &dest) {
+        return Err(refuse("is the input file"));
+    }
+    match std::fs::metadata(&dest) {
+        Ok(m) if m.is_dir() => return Err(refuse("is a directory")),
+        Ok(m) if !m.is_file() => return Ok(OutputPlan { dest, temp: None }),
+        Ok(m) if m.permissions().readonly() => return Err(refuse("exists and is read-only")),
+        _ => {}
+    }
+    let name = dest
+        .file_name()
+        .ok_or_else(|| refuse("has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = dest.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    Ok(OutputPlan {
+        dest,
+        temp: Some(temp),
+    })
 }
 
 /// Whether `output` names the input file: the same path after resolving
@@ -1101,7 +1189,7 @@ mod tests {
         let c = json!({
             "num_hidden_layers": 48, "full_attention_interval": 4,
             "num_key_value_heads": 2, "head_dim": 256, "torch_dtype": "bfloat16",
-            "linear_num_value_heads": 32, "linear_key_head_dim": 128,
+            "linear_num_value_heads": 32, "linear_num_key_heads": 16, "linear_key_head_dim": 128,
             "linear_value_head_dim": 128, "mamba_ssm_dtype": "float32",
         });
         let s = ModelSizes::from_config(&c, None).unwrap();
@@ -1191,7 +1279,7 @@ mod tests {
         assert!(config_err(c).contains("overflow"));
         let c = json!({
             "num_hidden_layers": 8, "full_attention_interval": 2, "num_key_value_heads": 1,
-            "head_dim": 1, "linear_num_value_heads": u64::MAX / 3,
+            "head_dim": 1, "linear_num_key_heads": 1, "linear_num_value_heads": u64::MAX / 3,
             "linear_key_head_dim": 1, "linear_value_head_dim": 1,
         });
         assert!(config_err(c).contains("overflow"));
@@ -1385,6 +1473,37 @@ mod tests {
     }
 
     #[test]
+    fn tp_must_divide_attention_heads_and_conv_width() {
+        // Qwen3.8-27B: 24 attention heads. tp 16 and 48 fit the 4 KV heads and
+        // the 48 value heads but not the attention heads.
+        for tp in [16, 48] {
+            let err = qwen3_8_27b(tp).sharding().err().unwrap().to_string();
+            assert!(err.contains("24 attention heads"), "tp {tp}: {err}");
+        }
+        // Qwen3-8B: 32 attention heads; tp 64 fits the 8 KV heads by replication.
+        let sizes = ModelSizes::from_config_file(fixture("qwen3-8b.json"), None).unwrap();
+        let mut opts = MooncakeOptions::new(sizes);
+        opts.tp = 64;
+        let err = opts.sharding().err().unwrap().to_string();
+        assert!(err.contains("32 attention heads"), "{err}");
+
+        // Convolution width 2 x 1 x 1 + 64 x 1 = 66, which tp 32 does not divide
+        // although it divides every head count.
+        let c = json!({
+            "num_hidden_layers": 4, "full_attention_interval": 2,
+            "num_attention_heads": 32, "num_key_value_heads": 32, "head_dim": 1,
+            "linear_num_key_heads": 1, "linear_key_head_dim": 1,
+            "linear_num_value_heads": 64, "linear_value_head_dim": 1,
+        });
+        let mut opts = MooncakeOptions::new(ModelSizes::from_config(&c, None).unwrap());
+        opts.tp = 32;
+        let err = opts.sharding().err().unwrap().to_string();
+        assert!(err.contains("convolution width 66"), "{err}");
+        opts.tp = 2;
+        assert!(opts.sharding().is_ok());
+    }
+
+    #[test]
     fn input_length_is_validated() {
         let err = parse_request(
             r#"{"timestamp": 0, "input_length": -9223372036854775808, "hash_ids": [1, 2]}"#,
@@ -1444,14 +1563,22 @@ mod tests {
         assert!(convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &bad, 4).is_err());
         assert_eq!(std::fs::read(&out).unwrap(), b"keep");
 
-        // A successful run replaces it, even when it is read-only (Unix):
-        // the new file is renamed over it rather than opened for writing.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o444)).unwrap();
-        }
+        // A read-only output is refused up front and left as it was.
         let opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+        let mut perms = std::fs::metadata(&out).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&out, perms.clone()).unwrap();
+        let err = convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &opts, 4)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("read-only"), "{err}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep");
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&out, perms).unwrap();
+
+        // A successful run replaces a writable output.
         convert_mooncake_to_parquet(fixture("trace.jsonl"), &out, &opts, 4).unwrap();
         assert_eq!(TraceReader::open(&out).unwrap().total_entries(), 13);
         let names: Vec<_> = std::fs::read_dir(dir.path())
@@ -1461,8 +1588,67 @@ mod tests {
         assert_eq!(names, ["out.parquet"]);
     }
 
-    /// The writer cannot create its temporary file: the existing (read-only)
-    /// output must survive.
+    #[test]
+    fn output_directory_is_refused_before_any_work() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sizes that would fail in the first pass: the output check comes first.
+        let bad = MooncakeOptions::new(ModelSizes::explicit(u64::MAX, 0));
+        let err = convert_mooncake_to_parquet(fixture("trace.jsonl"), dir.path(), &bad, 4)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(err.contains(&*dir.path().to_string_lossy()), "{err}");
+    }
+
+    #[test]
+    fn temp_names_are_unique_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = fixture("trace.jsonl");
+        let meta = std::fs::metadata(&input).unwrap();
+        let out = dir.path().join("out.parquet");
+        let a = plan_output(&input, &meta, &out).unwrap();
+        let b = plan_output(&input, &meta, &out).unwrap();
+        assert_eq!(a.dest, out);
+        assert_ne!(a.temp.unwrap(), b.temp.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_output_writes_through_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let target = real_dir.join("target.parquet");
+        std::fs::write(&target, b"old").unwrap();
+        let link = dir.path().join("link.parquet");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let opts = MooncakeOptions::new(ModelSizes::explicit(10, 0));
+        convert_mooncake_to_parquet(fixture("trace.jsonl"), &link, &opts, 4).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(TraceReader::open(&target).unwrap().total_entries(), 13);
+        let names: Vec<_> = std::fs::read_dir(&real_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["target.parquet"]);
+
+        // A dangling link is refused.
+        let dangling = dir.path().join("dangling.parquet");
+        std::os::unix::fs::symlink(dir.path().join("missing/x.parquet"), &dangling).unwrap();
+        let err = convert_mooncake_to_parquet(fixture("trace.jsonl"), &dangling, &opts, 4)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    /// The writer cannot create its temporary file: the existing output must
+    /// survive.
     #[cfg(unix)]
     #[test]
     fn unwritable_output_directory_keeps_existing_output() {
@@ -1472,7 +1658,6 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let out = sub.join("out.parquet");
         std::fs::write(&out, b"keep").unwrap();
-        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o444)).unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
         // Root ignores the permissions; nothing to test then.
         let probe = sub.join("probe");
@@ -1634,7 +1819,7 @@ mod tests {
         }
         assert!(meta["kvtrace.created"].ends_with("+00:00"));
         assert_eq!(meta["kvtrace.kv_tp_divisor"], "1");
-        assert_eq!(meta["kvtrace.state_tp_divisor"], "1");
+        assert_eq!(meta["kvtrace.state_tp_divisor"], "none");
         assert_eq!(meta.len(), 22);
     }
 

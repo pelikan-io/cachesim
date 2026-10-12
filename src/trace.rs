@@ -401,6 +401,14 @@ impl TraceWriter {
         self.writer.close()?;
         Ok(())
     }
+
+    /// Like [`finish`](Self::finish), then flush the file to stable storage
+    /// (`File::sync_all`) before returning.
+    pub fn finish_synced(mut self) -> Result<(), Error> {
+        self.flush_batch()?;
+        self.writer.into_inner()?.sync_all()?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
