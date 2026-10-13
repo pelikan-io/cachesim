@@ -205,6 +205,39 @@ impl GeometryArgs {
     }
 }
 
+/// Model options that `convert -f mooncake` took before it wrote request
+/// traces; they belong to `kv expand` now.
+const GEOMETRY_OPTIONS: &[&str] = &[
+    "--model",
+    "--revision",
+    "--model-config",
+    "--kv-bytes-per-token",
+    "--state-bytes",
+    "--kv-dtype",
+    "--model-name",
+    "--tp",
+    "--state-mode",
+    "--state-layout",
+];
+
+/// If `args` (without the program name) are a `convert` command line with a
+/// model option, the message pointing at `kv expand`.
+fn moved_geometry_option(args: impl IntoIterator<Item = String>) -> Option<String> {
+    let args: Vec<String> = args.into_iter().collect();
+    if args.first().map(String::as_str) != Some("convert") {
+        return None;
+    }
+    let flag = args.iter().find_map(|a| {
+        let name = a.split('=').next().unwrap_or(a);
+        GEOMETRY_OPTIONS.iter().find(|&&f| f == name)
+    })?;
+    Some(format!(
+        "{flag} is a `cachesim kv expand` option: `convert -f mooncake` now writes a \
+         model-independent request trace. Convert without model options, then run \
+         `cachesim kv expand -i <request trace> -o <output> {flag} ...`"
+    ))
+}
+
 /// Reject Mooncake options given with another input format.
 fn check_format_options(format: &InputFormatArg, mooncake: &MooncakeArgs) -> Result<(), String> {
     if matches!(format, InputFormatArg::Mooncake) || mooncake.chunk_tokens.is_none() {
@@ -453,7 +486,16 @@ fn parse_size(s: &str) -> Result<usize, String> {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            if let Some(msg) = moved_geometry_option(std::env::args().skip(1)) {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+            e.exit()
+        }
+    };
 
     match cli.command {
         Command::Simulate(sim) => {
@@ -697,6 +739,40 @@ mod tests {
             .finish()
             .unwrap();
         assert!(check_object_trace(&obj).is_ok());
+    }
+
+    #[test]
+    fn model_options_on_convert_point_at_kv_expand() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (line, flag) in [
+            (
+                &[
+                    "convert", "-i", "a", "-o", "b", "-f", "mooncake", "--tp", "8",
+                ][..],
+                "--tp",
+            ),
+            (
+                &["convert", "-f", "mooncake", "--model=Qwen/Qwen3-8B"],
+                "--model",
+            ),
+            (
+                &["convert", "--kv-bytes-per-token", "10"],
+                "--kv-bytes-per-token",
+            ),
+        ] {
+            // clap rejects the line, and the message names the option and kv expand.
+            assert!(
+                Cli::try_parse_from(std::iter::once("cachesim").chain(line.iter().copied()))
+                    .is_err()
+            );
+            let msg = moved_geometry_option(args(line)).unwrap();
+            assert!(
+                msg.starts_with(flag) && msg.contains("cachesim kv expand"),
+                "{msg}"
+            );
+        }
+        assert!(moved_geometry_option(args(&["convert", "-f", "mooncake"])).is_none());
+        assert!(moved_geometry_option(args(&["kv", "expand", "--tp", "8"])).is_none());
     }
 
     #[test]

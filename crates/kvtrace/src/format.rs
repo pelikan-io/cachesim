@@ -6,8 +6,14 @@
 //! | `req_id`        | `UInt64`                | no       | Request id                                    |
 //! | `input_tokens`  | `UInt32`                | no       | Prompt length in tokens, as the source gives  |
 //! | `output_tokens` | `UInt32`                | no       | Generated tokens                              |
-//! | `chunks`        | `List<UInt64>`          | no       | Ids of the request's full prefix chunks, in order |
+//! | `chunks`        | `List<UInt64>`          | no       | Ids of the request's full prefix chunks, in order, each below 2^48 |
 //! | `session_id`    | `UInt64`                | yes      | Session, for sources that need reconstruction |
+//!
+//! Chunk ids must be below 2^48 because an object id packs the chunk id with
+//! an object kind and a tensor-parallel rank in 64 bits
+//! (`chunk << 16 | kind << 12 | rank`, [`obj_id`](crate::obj_id));
+//! [`RequestWriter::write`] rejects larger ids. No column may be null except
+//! `session_id`; [`RequestReader`] rejects a batch with nulls elsewhere.
 //!
 //! Equal chunk ids mean equal prefix content. Every chunk covers the same
 //! number of tokens, given once per file by the `kvtrace.chunk_tokens`
@@ -151,8 +157,20 @@ impl RequestWriter {
             .append_key_value_metadata(KeyValue::new(key.into(), value.into()));
     }
 
-    /// Append one request (buffered; flushed in batches).
+    /// Append one request (buffered; flushed in batches). Errors if a chunk
+    /// id is 2^48 or more, since it would not fit an object id.
     pub fn write(&mut self, r: &Request) -> Result<(), Error> {
+        if let Some(&c) = r
+            .chunks
+            .iter()
+            .find(|&&c| c >= 1 << crate::objects::CHUNK_ID_BITS)
+        {
+            return Err(Error::InvalidFormat(format!(
+                "kvtrace: request {} has chunk id {c}, which is not below 2^{}",
+                r.req_id,
+                crate::objects::CHUNK_ID_BITS
+            )));
+        }
         self.timestamps.push(r.timestamp);
         self.req_ids.push(r.req_id);
         self.input_tokens.push(r.input_tokens);
@@ -252,14 +270,31 @@ impl Columns {
                 "kvtrace: request trace column chunks is not a list of UInt64".into(),
             ));
         }
-        Ok(Self {
+        let cols = Self {
             timestamp: col(batch, "timestamp")?,
             req_id: col(batch, "req_id")?,
             input_tokens: col(batch, "input_tokens")?,
             output_tokens: col(batch, "output_tokens")?,
             chunks,
             session_id: col(batch, "session_id")?,
-        })
+        };
+        // Files from other writers may declare these columns nullable; a
+        // null would otherwise read as 0 or an empty list.
+        let null_counts = [
+            ("timestamp", cols.timestamp.null_count()),
+            ("req_id", cols.req_id.null_count()),
+            ("input_tokens", cols.input_tokens.null_count()),
+            ("output_tokens", cols.output_tokens.null_count()),
+            ("chunks", cols.chunks.null_count()),
+            ("chunks item", cols.chunks.values().null_count()),
+        ];
+        if let Some((name, n)) = null_counts.iter().find(|(_, n)| *n > 0) {
+            return Err(Error::InvalidFormat(format!(
+                "kvtrace: request trace column {name} has {n} null values in a batch; \
+                 only session_id may be null"
+            )));
+        }
+        Ok(cols)
     }
 
     fn request(&self, i: usize) -> Request {
@@ -425,7 +460,7 @@ mod tests {
                 req_id: 7,
                 input_tokens: u32::MAX,
                 output_tokens: 1,
-                chunks: vec![u64::MAX, 0, 3],
+                chunks: vec![(1 << 48) - 1, 0, 3],
                 session_id: Some(0),
             },
         ]
@@ -503,5 +538,178 @@ mod tests {
         assert!(err.contains("version"), "{err}");
 
         assert!(RequestWriter::create(dir.path().join("z.parquet"), 0, 16).is_err());
+    }
+
+    #[test]
+    fn chunk_ids_must_fit_48_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RequestWriter::create(dir.path().join("r.parquet"), 256, 16).unwrap();
+        let mut r = sample().remove(0);
+        r.chunks = vec![1, 1 << 48];
+        let err = w.write(&r).unwrap_err().to_string();
+        assert!(err.contains("2^48"), "{err}");
+        r.chunks = vec![(1 << 48) - 1];
+        assert!(w.write(&r).is_ok());
+    }
+
+    /// A file in the request schema but with every column nullable, as
+    /// another writer might produce, with the given arrays.
+    fn write_nullable(path: &Path, compression: Compression, arrays: Vec<ArrayRef>) {
+        let item = Arc::new(Field::new("item", DataType::UInt64, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                true,
+            ),
+            Field::new("req_id", DataType::UInt64, true),
+            Field::new("input_tokens", DataType::UInt32, true),
+            Field::new("output_tokens", DataType::UInt32, true),
+            Field::new("chunks", DataType::List(item), true),
+            Field::new("session_id", DataType::UInt64, true),
+        ]));
+        let props = WriterProperties::builder()
+            .set_compression(compression)
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema.clone(), Some(props)).unwrap();
+        for (k, v) in [
+            (KEY_FORMAT, FORMAT_REQUESTS),
+            (KEY_VERSION, FORMAT_VERSION),
+            (KEY_CHUNK_TOKENS, "256"),
+        ] {
+            w.append_key_value_metadata(KeyValue::new(k.to_string(), v.to_string()));
+        }
+        w.write(&RecordBatch::try_new(schema, arrays).unwrap())
+            .unwrap();
+        w.close().unwrap();
+    }
+
+    /// Two requests; `null` picks the column given a null in request 1.
+    fn arrays(null: Option<&str>) -> Vec<ArrayRef> {
+        let n = |c: &str| null == Some(c);
+        let mut chunks = ListBuilder::new(UInt64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::UInt64,
+            true,
+        )));
+        chunks.values().append_slice(&[1, 2]);
+        chunks.append(true);
+        if n("chunks") {
+            chunks.append(false);
+        } else {
+            chunks.values().append_value(3);
+            if n("chunks item") {
+                chunks.values().append_null();
+            }
+            chunks.append(true);
+        }
+        vec![
+            Arc::new(
+                TimestampNanosecondArray::from(vec![Some(1), (!n("timestamp")).then_some(2)])
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(UInt64Array::from(vec![
+                Some(0),
+                (!n("req_id")).then_some(1),
+            ])),
+            Arc::new(UInt32Array::from(vec![
+                Some(512),
+                (!n("input_tokens")).then_some(256),
+            ])),
+            Arc::new(UInt32Array::from(vec![
+                Some(1),
+                (!n("output_tokens")).then_some(1),
+            ])),
+            Arc::new(chunks.finish()),
+            Arc::new(UInt64Array::from(vec![None, Some(4)])),
+        ]
+    }
+
+    #[test]
+    fn nulls_are_rejected_except_in_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.parquet");
+        write_nullable(&path, Compression::UNCOMPRESSED, arrays(None));
+        let got: Vec<Request> = RequestReader::open(&path)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(got[1].chunks, [3]);
+        assert_eq!((got[0].session_id, got[1].session_id), (None, Some(4)));
+
+        for col in [
+            "timestamp",
+            "req_id",
+            "input_tokens",
+            "output_tokens",
+            "chunks",
+            "chunks item",
+        ] {
+            let path = dir.path().join(format!("{col}.parquet"));
+            write_nullable(&path, Compression::UNCOMPRESSED, arrays(Some(col)));
+            let err = RequestReader::open(&path)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("column {col} has 1 null")),
+                "{col}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snappy_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snappy.parquet");
+        write_nullable(&path, Compression::SNAPPY, arrays(None));
+        assert_eq!(RequestReader::open(&path).unwrap().count(), 2);
+    }
+
+    /// Written by pyarrow 21 with its defaults (snappy compression, list item
+    /// field named `element`):
+    ///
+    /// ```python
+    /// t = pa.table({
+    ///     "timestamp": pa.array([1_000_000, 2_000_000], pa.timestamp("ns", tz="UTC")),
+    ///     "req_id": pa.array([0, 1], pa.uint64()),
+    ///     "input_tokens": pa.array([700, 300], pa.uint32()),
+    ///     "output_tokens": pa.array([5, 1], pa.uint32()),
+    ///     "chunks": pa.array([[0, 1], []], pa.list_(pa.uint64())),
+    ///     "session_id": pa.array([None, 9], pa.uint64()),
+    /// }).replace_schema_metadata({"kvtrace.format": "requests",
+    ///     "kvtrace.version": "1", "kvtrace.chunk_tokens": "256"})
+    /// pq.write_table(t, "pyarrow-snappy.parquet")
+    /// ```
+    #[test]
+    fn pyarrow_file_is_read() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/requests/pyarrow-snappy.parquet");
+        let r = RequestReader::open(&path).unwrap();
+        assert_eq!(r.chunk_tokens(), 256);
+        let got: Vec<Request> = r.collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            got,
+            [
+                Request {
+                    timestamp: 1_000_000,
+                    req_id: 0,
+                    input_tokens: 700,
+                    output_tokens: 5,
+                    chunks: vec![0, 1],
+                    session_id: None,
+                },
+                Request {
+                    timestamp: 2_000_000,
+                    req_id: 1,
+                    input_tokens: 300,
+                    output_tokens: 1,
+                    chunks: vec![],
+                    session_id: Some(9),
+                },
+            ]
+        );
     }
 }

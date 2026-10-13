@@ -1,4 +1,4 @@
-//! Request to objects: the KV-cache objects a request reads, with their ids
+//! Request to objects: the KV-cache objects a request writes, with their ids
 //! and sizes, for one model geometry.
 //!
 //! A request's chunks are its full prefix chunks in order. Each chunk becomes
@@ -8,6 +8,54 @@
 //!
 //! Objects come out in prefix order: chunk by chunk, each chunk's objects in
 //! rank order, then its separate state objects (if any) in rank order.
+//!
+//! # Objects
+//!
+//! The defaults follow LMCache v0.5.5 (commit 05a013b):
+//!
+//! * One object is one chunk across all layers (LMCache's chunk is 256 tokens
+//!   by default, `lmcache/v1/config.py:90`; here the chunk length comes from
+//!   the request trace). A chunk's size is its token count times the model's
+//!   KV bytes per token.
+//! * With tensor parallelism each rank stores its own shard as a separate
+//!   object (the key includes the worker id, `lmcache/utils.py:389-441`). A
+//!   shard is `1/min(tp, kv_heads)` of the KV, since vLLM replicates KV heads
+//!   once `tp` reaches their count, and `1/tp` of the recurrent state; see
+//!   [`Geometry`]. MLA models are the exception: only the first rank stores,
+//!   and it stores the full latent (`save_only_first_rank`,
+//!   `cache_engine.py:116-119`).
+//!
+//! # Hybrid models
+//!
+//! Linear-attention layers keep a fixed-size recurrent state per sequence
+//! instead of per-token KV. vLLM v0.31 snapshots that state only at some
+//! block boundaries when prefix caching is on ("align" mode,
+//! `vllm/config/cache.py:190-198`), so [`StateMode::PerRequest`] (one
+//! snapshot at the request's last chunk) is the default and
+//! [`StateMode::PerChunk`] is the upper bound. LMCache by default keeps
+//! attention and state pages in one object (`separate_object_groups` off,
+//! `kv_layer_groups.py:332-358`): [`StateLayout::Combined`] adds the state
+//! bytes to that chunk's object, as a distinct object kind because its bytes
+//! differ from the same chunk without state; [`StateLayout::Separate`] makes
+//! the state its own object. vLLM pads the state page to the attention page
+//! size (`platforms/interface.py:1006-1009`); that padding is not modelled.
+//! Convolution state is ignored.
+//!
+//! # Writes, not reuse
+//!
+//! [`ObjectMapper::objects`] lists the objects a request writes (or looks
+//! up before writing): every chunk of its prefix. Which of them a later
+//! request can reuse is the consumer's rule, not this module's. For a model
+//! without recurrent state, any prefix of chunks found in the store is
+//! usable. For a hybrid model, a prefix hit is usable only up to the last
+//! chunk that carries a state snapshot ([`ObjectKind::carries_state`]:
+//! [`ObjectKind::KvWithState`], or a chunk followed by [`ObjectKind::State`]
+//! objects): the linear-attention layers need the state at the point where
+//! computation resumes, so a prefix of KV-only chunks that ends anywhere else
+//! cannot be resumed from. Consumers apply this with [`KvObject::kind`] and
+//! [`KvObject::chunk_index`]. Under [`StateMode::PerRequest`] a request's
+//! snapshot sits on its own last chunk, so a later request with a longer
+//! prompt can reuse that request's chunks only through that last chunk.
 
 use crate::geometry::{overflow, Geometry, Sharding, StateLayout, StateMode};
 use crate::Error;
@@ -30,6 +78,14 @@ pub enum ObjectKind {
 }
 
 impl ObjectKind {
+    /// Whether an object of this kind holds a recurrent-state snapshot
+    /// ([`State`](Self::State) or [`KvWithState`](Self::KvWithState)). For a
+    /// hybrid model, a cached prefix can be resumed only at a chunk with such
+    /// an object; see the [module docs](self#writes-not-reuse).
+    pub fn carries_state(self) -> bool {
+        matches!(self, Self::State | Self::KvWithState)
+    }
+
     /// The kind's 4-bit code in an object id: 0, 1, 2.
     pub fn code(self) -> u64 {
         match self {
@@ -286,6 +342,34 @@ mod tests {
             assert_eq!(ObjectKind::from_code(k.code()), Some(k));
         }
         assert_eq!(ObjectKind::from_code(3), None);
+        assert!(!ObjectKind::Kv.carries_state());
+        assert!(ObjectKind::State.carries_state());
+        assert!(ObjectKind::KvWithState.carries_state());
+    }
+
+    /// The chunks that carry state, by chunk index, are where a hybrid
+    /// prefix can resume: the last chunk under per-request state, every chunk
+    /// under per-chunk state, in either layout.
+    #[test]
+    fn resumable_chunks_follow_the_state_mode() {
+        let resumable = |mode, layout| -> Vec<u32> {
+            let mut g = Geometry::new(ModelSizes::explicit(10, 1000));
+            g.state_mode = mode;
+            g.state_layout = layout;
+            let m = ObjectMapper::new(&g, 256).unwrap();
+            let mut idx: Vec<u32> = m
+                .objects(&[1, 2, 3])
+                .unwrap()
+                .filter(|o| o.kind.carries_state())
+                .map(|o| o.chunk_index)
+                .collect();
+            idx.dedup();
+            idx
+        };
+        for layout in [StateLayout::Combined, StateLayout::Separate] {
+            assert_eq!(resumable(StateMode::PerRequest, layout), [2]);
+            assert_eq!(resumable(StateMode::PerChunk, layout), [0, 1, 2]);
+        }
     }
 
     #[test]

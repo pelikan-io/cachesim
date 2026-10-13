@@ -45,7 +45,8 @@ jobs:
       - name: Test cachetrace core (no importers)
         run: cargo test -p cachetrace --no-default-features
 
-      # kvtrace as a load generator depends on it: no HTTP client.
+      # A load generator depends on kvtrace without hf-fetch, so it must
+      # build and pass its tests without the HTTP client.
       - name: Test kvtrace without hf-fetch
         run: cargo test -p kvtrace --no-default-features
 
@@ -108,7 +109,7 @@ jobs:
       - name: Packages include README and LICENSE
         shell: bash
         run: |
-          for p in cachetrace cachesim-rs; do
+          for p in cachetrace kvtrace cachesim-rs; do
             files=$(cargo package --list -p "$p" --allow-dirty)
             for f in README.md LICENSE; do
               echo "$files" | grep -qx "$f" || { echo "$p package lacks $f" >&2; exit 1; }

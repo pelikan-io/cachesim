@@ -1,0 +1,4 @@
+{"timestamp": 0, "input_length": 700, "output_length": 5, "hash_ids": [0, 1]}
+{"timestamp": 3, "input_length": 1100, "output_length": 5, "hash_ids": [0, 1, 2]}
+{"timestamp": 5, "input_length": 2000, "output_length": 1, "hash_ids": [3]}
+{"timestamp": 7, "input_length": 300, "output_length": 1, "hash_ids": [4, 5]}

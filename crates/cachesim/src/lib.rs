@@ -118,7 +118,9 @@ impl From<cachetrace::Error> for Error {
 }
 
 /// Each `kvtrace` error maps to the variant of the same name, carrying the
-/// same source error or message.
+/// same source error or message. `kvtrace::Error` is non-exhaustive: a variant
+/// added there later becomes `InvalidFormat` with its message until it gets
+/// an arm here.
 impl From<kvtrace::Error> for Error {
     fn from(e: kvtrace::Error) -> Self {
         match e {
@@ -127,6 +129,7 @@ impl From<kvtrace::Error> for Error {
             kvtrace::Error::Arrow(e) => Self::Arrow(e),
             kvtrace::Error::InvalidFormat(m) => Self::InvalidFormat(m),
             kvtrace::Error::Fetch(m) => Self::Fetch(m),
+            other => Self::InvalidFormat(other.to_string()),
         }
     }
 }

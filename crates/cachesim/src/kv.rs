@@ -252,9 +252,10 @@ mod tests {
     use kvtrace::{obj_id, ModelSizes, ObjectKind, StateLayout, StateMode};
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
+    /// Copies of kvtrace's fixtures, so the packaged crate's tests have them.
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../kvtrace/tests/fixtures")
+            .join("tests/fixtures")
             .join(name)
     }
 
@@ -391,6 +392,18 @@ mod tests {
         assert_eq!(summary.rows, 10);
         assert!(rows.iter().all(|r| r.obj_size == 3072));
         assert!(rows.iter().all(|r| kvtrace::obj_id_fields(r.obj_id).2 == 0));
+        assert_eq!(meta["kvtrace.mla_first_rank_only"], "True");
+
+        // DeepSeek-V3's published config at tp 8: one first-rank object per
+        // chunk of 256 x 61 x (512 + 64) x 2 bytes.
+        let sizes = ModelSizes::from_config_file(fixture("models/deepseek-v3.json"), None).unwrap();
+        let mut g = Geometry::new(sizes);
+        g.tp = 8;
+        let (summary, rows, meta) = expand(&g);
+        assert_eq!(summary.rows, 10);
+        assert!(rows.iter().all(|r| r.obj_size == 256 * 70_272));
+        assert!(rows.iter().all(|r| kvtrace::obj_id_fields(r.obj_id).2 == 0));
+        assert_eq!(meta["kvtrace.kv_tp_divisor"], "1");
         assert_eq!(meta["kvtrace.mla_first_rank_only"], "True");
     }
 

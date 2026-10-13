@@ -34,7 +34,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 /// Error type for kvtrace operations.
+///
+/// Non-exhaustive so that a variant can be added without breaking callers
+/// that match on it.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -729,6 +729,27 @@ mod tests {
         assert!(opts.sharding().is_ok());
     }
 
+    /// DeepSeek-V3's config.json as published (deepseek-ai/DeepSeek-V3, main):
+    /// MLA with a 512-wide latent and 64-wide rope key over 61 layers.
+    #[test]
+    fn sizes_deepseek_v3_mla() {
+        let s = ModelSizes::from_config_file(fixture("deepseek-v3.json"), None).unwrap();
+        assert!(s.mla);
+        assert_eq!(s.kv_bytes_per_token, 61 * (512 + 64) * 2);
+        assert_eq!(s.state_bytes_per_sequence, 0);
+        assert_eq!(s.kv_heads, None);
+        assert_eq!(s.attention_heads, Some(128));
+        // tp 8: first rank only, full latent.
+        let mut g = Geometry::new(s);
+        g.tp = 8;
+        let shard = g.sharding().unwrap();
+        assert_eq!((shard.ranks, shard.kv_per_token), (1, 70_272));
+        // tp must still divide the 128 attention heads.
+        g.tp = 3;
+        let err = g.sharding().unwrap_err().to_string();
+        assert!(err.contains("128 attention heads"), "{err}");
+    }
+
     #[test]
     fn tp_range_is_validated() {
         let mut g = Geometry::new(ModelSizes::explicit(4096, 0));
