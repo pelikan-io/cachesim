@@ -147,15 +147,17 @@ trace and takes only `--chunk-tokens`; the model options moved to
 `cachesim kv expand`; giving one of them to `convert` is an error that says
 so. `simulate` and `info` refuse a request trace.
 
-`expand(convert(x))` differs from the old direct conversion in three ways,
-all following from keeping full chunks only (see below):
+`expand(convert(x))` differs from the old direct conversion in these ways:
 
-- Rows of partial chunks are dropped.
+- Rows of partial chunks are dropped (only full chunks are kept).
 - With a recurrent state and `--state-mode per-request`, the snapshot moves
-  from the dropped partial chunk to the request's last full chunk: that
-  chunk's rows change kind (0 → 2 with `combined`, and gain the state bytes;
-  with `separate`, its state objects are added after it).
-- `next_access_vtime` is renumbered for the shorter row sequence.
+  from the dropped partial chunk to the request's last full chunk. With
+  `combined`, that chunk's write gains the state bytes; with `separate`, its
+  state objects are added after it.
+- With `combined`, a write that carries state is keyed on the chunk's own
+  id instead of a separate kind-2 id (see object ids below), so those rows
+  change `obj_id`, and one id can be written at two sizes.
+- `next_access_vtime` is renumbered for the new row sequence and ids.
 
 On the public Mooncake conversation trace, with Qwen3-8B at TP 1, a 27B
 hybrid at TP 8 (both state modes and both layouts) and DeepSeek-V3 at TP 8,
@@ -187,15 +189,16 @@ as given.
 
 One token prefix can get two chunk ids. A hash id covers a whole block, so a
 partial last block and the full block that later extends it have different
-ids even when their first tokens agree. When a request's last block is
-partial with at least `--chunk-tokens` tokens, its sub-chunk 0 is a full
-chunk keyed on the partial block's id; a later request with the same prefix
-that holds that block in full reads the same tokens under the full block's
-id. A store keyed on the token prefix (as LMCache's is) would hit there, so
-the converted trace undercounts prefix reuse. The trace cannot show whether
-the tokens agree, so the count is an upper bound. At 256 tokens per chunk,
-the later full-chunk reads affected: conversation 14,844 of 559,542 (2.7%),
+ids even when their first tokens agree. Every full sub-chunk of a partial
+last block is keyed on that partial block's id; a later request with the
+same prefix that holds the block in full reads the same token positions
+under the full block's id. A store keyed on the token prefix (as LMCache's
+is) would hit there, so the converted trace undercounts prefix reuse. The
+trace cannot show whether the tokens agree, so the count is an upper bound.
+At 256 tokens per chunk only sub-chunk 0 of such a block is full, and the
+later full-chunk reads affected are: conversation 14,844 of 559,542 (2.7%),
 toolagent 21,254 of 782,217 (2.7%), synthetic 3,001 of 237,347 (1.3%).
+Smaller chunks give more affected sub-chunks per block.
 
 The input must be an uncompressed regular file: directories, pipes and
 `.zst`/`.zstd`/`.gz` files (any letter case) are rejected; decompress first.
@@ -211,12 +214,13 @@ The input must be an uncompressed regular file: directories, pipes and
 | `chunks`        | `List<UInt64>`         | no       | Full prefix chunk ids, in prefix order; each < 2^48 |
 | `session_id`    | `UInt64`               | yes      | Session id, for sources that need reconstruction    |
 
-Chunk ids must be below 2^48 because an object id packs the chunk id with an
-object kind and a rank into 64 bits (`chunk << 16 | kind << 12 | rank`);
-the writer rejects larger ids. Only `session_id` may be null; the reader
-rejects nulls in any other column or in a `chunks` item. Files from other
-Parquet writers can be read, including snappy-compressed ones (pyarrow's
-default).
+Chunk ids must be below 2^48 because an object id packs the chunk id with a
+key slot and a rank into 64 bits (`chunk << 16 | slot << 12 | rank`); the
+writer rejects larger ids, and the reader rejects them with the file, row
+and `req_id`. Only `session_id` may be null; the reader rejects nulls in any
+other column or in a `chunks` item. Files from other Parquet writers can be
+read if they are uncompressed or compressed with snappy (pyarrow's default)
+or zstd; gzip, lz4 and brotli are not built in and fail to open.
 
 Footer key-value metadata: `kvtrace.format` = `requests`, `kvtrace.version` =
 `1`, `kvtrace.chunk_tokens` (every chunk's length), `kvtrace.created`,
@@ -258,41 +262,52 @@ Objects (defaults follow LMCache v0.5.5):
   is the default because vLLM v0.31 snapshots the state only at some block
   boundaries when prefix caching is on ("align" mode,
   `vllm/config/cache.py:190-198`); per-chunk is the upper bound.
-  `--state-layout combined` (default) adds the state bytes to that chunk's
-  object, which becomes a distinct object kind, as LMCache keeps attention
-  and state pages in one object by default (`separate_object_groups` off,
-  `kv_layer_groups.py:332-358`); `separate` stores the state as its own
-  object. vLLM pads the state page to the attention page size
-  (`platforms/interface.py:1006-1009`); that padding is not modelled, and
-  convolution state is not counted.
-- The objects are the ones each request writes (or looks up): every chunk
-  of its prefix. Which a later request can reuse is up to the consumer. For
-  a hybrid model a prefix hit is usable only up to the last chunk that
-  carries a state snapshot (kind 2, or a chunk followed by kind-1 objects;
-  `ObjectKind::carries_state()` in kvtrace): the linear-attention layers
-  need the state where computation resumes, so a prefix of KV-only chunks
-  ending anywhere else cannot be resumed from. A replay of the expanded
-  trace with the object-level engines does not apply this rule; it counts a
-  KV-only chunk hit as a hit.
+  `--state-layout combined` (default) adds the state bytes to the chunk's
+  object; `separate` stores the state as its own object. vLLM pads the
+  state page to the attention page size (`platforms/interface.py:1006-1009`);
+  that padding is not modelled, and convolution state is not counted.
 
 Columns of the expanded trace:
 
 | Column              | Value                                                  |
 |---------------------|--------------------------------------------------------|
 | `timestamp`         | the request's timestamp                                |
-| `obj_id`            | `chunk << 16 \| kind << 12 \| rank`                     |
-| `obj_size`          | bytes the rank stores for the object                   |
+| `obj_id`            | `chunk << 16 \| slot << 12 \| rank`                     |
+| `obj_size`          | bytes this request's write of the object holds         |
 | `next_access_vtime` | row index of the next access to the `obj_id`, or `-1`  |
 | `op`                | `1` (GET) on every row                                 |
 | `ttl`               | null                                                   |
 
+Object ids are what the store keys objects on. With `combined`, LMCache keeps
+a chunk's attention and state pages in a single object group when
+`separate_object_groups` is off (the default) and stores it as one object
+keyed by the chunk (`kv_layer_groups.py:682-687`). So a chunk has one id per
+rank (slot 0) whether or not a write carries state, and that id can be
+written at two sizes: KV only, or KV and state. A write replaces the object,
+so a store holds the size of the last write it accepted. `obj_size` on each
+row is the size of that request's write; ids written at more than one size
+are counted in `kvtrace.multi_size_objects`. With `separate`, the state
+object has its own key (slot 1) next to the chunk's KV object (slot 0).
+
 For a Mooncake trace, `chunk` is `block << 8 | sub-chunk`, so `obj_id` is
-`block << 24 | sub-chunk << 16 | kind << 12 | rank` as before. `kind` is 0 for
-KV, 1 for a separate state object, and 2 for KV and state in one object.
-Every row is a GET: on a miss the engine computes the chunk and stores it, so
-writes in a replay come from fill on miss. Rows follow the requests in order
-and each request's prefix in order: per chunk, its rank objects, then its
-separate state objects.
+`block << 24 | sub-chunk << 16 | slot << 12 | rank`. Every row is a GET: on a
+miss the engine computes the chunk and stores it, so writes in a replay come
+from fill on miss. Rows follow the requests in order and each request's
+prefix in order: per chunk, its rank objects, then its separate state
+objects.
+
+The rows are the objects each request writes: every chunk of its prefix.
+Which stored objects a later request can reuse is up to the consumer. For a
+model without recurrent state, any prefix of chunks found in the store is
+usable. For a hybrid model a prefix hit is usable only through the last
+chunk whose stored object carries state: the linear-attention layers need
+the state where computation resumes. kvtrace's `ObjectMapper::lookup_ids`
+gives the ids to probe at a chunk: with `combined` the one id, and the
+consumer must remember whether the write that stored it carried state
+(`KvObject::kind`, `ObjectKind::carries_state()`); with `separate` the KV id
+and the state id, and the chunk is resumable when the state id is present.
+A replay of the expanded trace with the object-level engines does not apply
+this rule; it counts a KV-only chunk hit as a hit.
 
 Model sizes come from one of:
 
@@ -511,9 +526,11 @@ are still built, through `arrow` and `parquet` (Parquet's ZSTD codec needs
 - **`ObjectMapper`** (`objects`) — built from a `Geometry` and a chunk
   length; `objects(&chunks)` yields each **`KvObject`** of a request (`obj_id`,
   `size`, `rank`, `kind`, `chunk_index`) in prefix order: the objects the
-  request writes. **`obj_id()`**, **`obj_id_fields()`** and **`ObjectKind`**
-  describe the id layout; **`ObjectKind::carries_state()`** marks the kinds
-  where a hybrid model's prefix can resume.
+  request writes. **`lookup_ids(chunk, rank)`** gives the ids a lookup
+  probes. **`obj_id()`**, **`obj_id_fields()`**, `SLOT_CHUNK`/`SLOT_STATE`
+  and **`ObjectKind::key_slot()`** describe the id layout;
+  **`ObjectKind::carries_state()`** marks the writes where a hybrid model's
+  prefix can resume.
 - **`mooncake::convert_mooncake()`** — Mooncake JSON lines to a request
   trace; **`mooncake::chunk_id()`** is the chunk id rule.
 - **`output::plan_output()`** — the output handling described above.

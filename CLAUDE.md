@@ -39,7 +39,7 @@ crates/cachetrace/src/lib.rs     TraceEntry, Op, trace_schema(), TraceReader/Wri
 crates/cachetrace/src/import.rs  libCacheSim binary + cache-trace CSV importers (feature `import`)
 crates/kvtrace/src/format.rs     Request trace schema, Request, RequestReader/Writer, kvtrace.* metadata keys
 crates/kvtrace/src/geometry.rs   ModelSizes (config.json → sizes), Geometry, Sharding (TP checks)
-crates/kvtrace/src/objects.rs    ObjectMapper: request chunks → KvObject (obj_id, size, rank, kind, chunk_index)
+crates/kvtrace/src/objects.rs    ObjectMapper: request chunks → KvObject (obj_id, size, rank, kind, chunk_index); lookup_ids. obj_id = chunk<<16 | slot<<12 | rank: slot 0 = the chunk's object (combined layout: KV and KV+state writes share it, so one id can have two sizes), slot 1 = separate state object
 crates/kvtrace/src/mooncake.rs   Mooncake JSON lines → request trace (full chunks only, chunk_id)
 crates/kvtrace/src/output.rs     plan_output: output refusals, temp file + rename
 crates/kvtrace/src/hf.rs         Hugging Face config.json fetch + cache (feature `hf-fetch`, default on)
