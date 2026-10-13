@@ -3,10 +3,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use cachesim::mooncake::{
-    convert_mooncake_to_parquet, sha256_hex, ModelSizes, MooncakeOptions, StateLayout, StateMode,
-    DTYPE_NAMES,
-};
+use cachesim::kv::expand_to_parquet;
+use cachesim::kvtrace::format::{FORMAT_REQUESTS, KEY_FORMAT};
+use cachesim::kvtrace::mooncake::{convert_mooncake, MooncakeOptions};
+use cachesim::kvtrace::{sha256_hex, Geometry, ModelSizes, StateLayout, StateMode, DTYPE_NAMES};
 use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{
     simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig,
@@ -58,12 +58,56 @@ enum Command {
         #[arg(short, long)]
         trace: PathBuf,
     },
+
+    /// KV-cache request traces (made by `convert -f mooncake`).
+    #[command(subcommand)]
+    Kv(KvCommand),
+}
+
+#[derive(Subcommand)]
+enum KvCommand {
+    /// Expand a request trace into an object-level trace for one model
+    /// geometry, readable by `simulate` and `info`.
+    Expand {
+        /// Request trace (Parquet).
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output object-level trace (Parquet).
+        #[arg(short, long)]
+        output: PathBuf,
+
+        #[command(flatten)]
+        geometry: GeometryArgs,
+    },
+    // A KV simulation mode that replays request traces directly goes here.
 }
 
 /// Options for `-f mooncake`.
 #[derive(Args)]
 #[command(next_help_heading = "Mooncake options (-f mooncake)")]
 struct MooncakeArgs {
+    // No clap default so that main() can tell whether it was given with
+    // another format; options() applies the default.
+    /// Tokens per chunk; must divide the 512-token source block [default: 256].
+    #[arg(long, value_name = "N")]
+    chunk_tokens: Option<u64>,
+}
+
+impl MooncakeArgs {
+    fn options(&self) -> MooncakeOptions {
+        MooncakeOptions {
+            chunk_tokens: self
+                .chunk_tokens
+                .unwrap_or(MooncakeOptions::default().chunk_tokens),
+        }
+    }
+}
+
+/// Model geometry for `kv expand`.
+#[derive(Args)]
+#[command(next_help_heading = "Model geometry")]
+struct GeometryArgs {
     /// Hugging Face repository id, e.g. Qwen/Qwen3-8B. Its config.json is
     /// downloaded (or read from the local cache) and sizes derived from it.
     #[arg(long, value_name = "REPO_ID", conflicts_with_all = ["model_config", "kv_bytes_per_token", "model_name"])]
@@ -94,14 +138,9 @@ struct MooncakeArgs {
     #[arg(long, value_name = "NAME")]
     model_name: Option<String>,
 
-    // The options below have no clap defaults so that main() can tell whether
-    // they were given with another format; options() applies the defaults.
-    /// Tokens per object; must divide the 512-token source block [default: 256].
-    #[arg(long, value_name = "N")]
-    chunk_tokens: Option<u64>,
-
-    /// Tensor-parallel degree: one object per rank, 1/N of the bytes (MLA
-    /// models: first rank only, full size) [default: 1].
+    /// Tensor-parallel degree: one object per rank, each holding the rank's
+    /// share of the bytes (MLA models: first rank only, full size)
+    /// [default: 1].
     #[arg(long, value_name = "N")]
     tp: Option<u64>,
 
@@ -116,8 +155,8 @@ struct MooncakeArgs {
     state_layout: Option<StateLayoutArg>,
 }
 
-impl MooncakeArgs {
-    fn options(&self) -> Result<MooncakeOptions, Box<dyn std::error::Error>> {
+impl GeometryArgs {
+    fn geometry(&self) -> Result<Geometry, Box<dyn std::error::Error>> {
         let kv_dtype = self.kv_dtype.as_deref();
         let (sizes, config_sha256, model_name, model_revision) =
             match (&self.model, &self.model_config, self.kv_bytes_per_token) {
@@ -149,56 +188,56 @@ impl MooncakeArgs {
                 ),
                 _ => {
                     return Err(
-                        "-f mooncake needs one of --model, --model-config, --kv-bytes-per-token"
+                        "kv expand needs one of --model, --model-config, --kv-bytes-per-token"
                             .into(),
                     )
                 }
             };
-        Ok(MooncakeOptions {
+        Ok(Geometry {
             sizes,
             model_name,
             model_revision,
             model_config_sha256: config_sha256,
-            chunk_tokens: self.chunk_tokens.unwrap_or(256),
             tp: self.tp.unwrap_or(1),
             state_mode: self.state_mode.unwrap_or(StateModeArg::PerRequest).into(),
             state_layout: self.state_layout.unwrap_or(StateLayoutArg::Combined).into(),
         })
     }
-
-    /// The Mooncake options given on the command line.
-    fn given(&self) -> Vec<&'static str> {
-        [
-            ("--model", self.model.is_some()),
-            ("--revision", self.revision.is_some()),
-            ("--model-config", self.model_config.is_some()),
-            ("--kv-bytes-per-token", self.kv_bytes_per_token.is_some()),
-            ("--state-bytes", self.state_bytes.is_some()),
-            ("--kv-dtype", self.kv_dtype.is_some()),
-            ("--model-name", self.model_name.is_some()),
-            ("--chunk-tokens", self.chunk_tokens.is_some()),
-            ("--tp", self.tp.is_some()),
-            ("--state-mode", self.state_mode.is_some()),
-            ("--state-layout", self.state_layout.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(flag, given)| given.then_some(flag))
-        .collect()
-    }
 }
 
 /// Reject Mooncake options given with another input format.
 fn check_format_options(format: &InputFormatArg, mooncake: &MooncakeArgs) -> Result<(), String> {
-    let given = mooncake.given();
-    if matches!(format, InputFormatArg::Mooncake) || given.is_empty() {
+    if matches!(format, InputFormatArg::Mooncake) || mooncake.chunk_tokens.is_none() {
         return Ok(());
     }
-    Err(format!("{} apply only to -f mooncake", given.join(", ")))
+    Err("--chunk-tokens applies only to -f mooncake".into())
+}
+
+/// Refuse a request trace where an object-level trace is expected: its
+/// columns would read as zeros.
+fn check_object_trace(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;
+    let is_requests = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .into_iter()
+        .flatten()
+        .any(|kv| kv.key == KEY_FORMAT && kv.value.as_deref() == Some(FORMAT_REQUESTS));
+    if is_requests {
+        return Err(format!(
+            "{} is a KV-cache request trace; run `cachesim kv expand` on it first",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "hf-fetch")]
 fn fetch_model_config(repo: &str, revision: &str) -> Result<Vec<u8>, cachesim::Error> {
-    cachesim::hf::fetch_config(repo, revision)
+    Ok(cachesim::kvtrace::hf::fetch_config(repo, revision)?)
 }
 
 #[cfg(not(feature = "hf-fetch"))]
@@ -354,7 +393,7 @@ enum InputFormatArg {
     OracleGeneralOpNs,
     /// pelikan-io/cache-trace CSV (optionally zstd-compressed)
     CacheTrace,
-    /// Mooncake trace (JSON lines), expanded into KV-cache objects
+    /// Mooncake trace (JSON lines), to a KV-cache request trace
     Mooncake,
 }
 
@@ -418,6 +457,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Simulate(sim) => {
+            check_object_trace(&sim.trace)?;
             let cache_size =
                 parse_size(&sim.cache_size).map_err(|e| format!("bad --cache-size: {e}"))?;
 
@@ -510,26 +550,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     convert_cache_trace_to_parquet(&input, &output, 65_536)?
                 }
                 InputFormatArg::Mooncake => {
-                    let opts = mooncake.options()?;
+                    let opts = mooncake.options();
+                    let s = convert_mooncake(&input, &output, &opts, 65_536)?;
                     eprintln!(
-                        "  KV bytes/token: {}, state bytes/sequence: {}, tp: {}, mla: {}",
-                        opts.sizes.kv_bytes_per_token,
-                        opts.sizes.state_bytes_per_sequence,
-                        opts.tp,
-                        opts.sizes.mla
+                        "  {} requests, {} full chunks of {} tokens, {} requests without a full chunk",
+                        s.requests, s.chunks, opts.chunk_tokens, s.requests_without_chunks
                     );
-                    let s = convert_mooncake_to_parquet(&input, &output, &opts, 65_536)?;
                     eprintln!(
-                        "  {} requests, {} objects, {} size conflicts",
-                        s.requests, s.objects, s.size_conflicts
+                        "  input_length disagrees with hash_ids: {} beyond 512 x blocks, {} short of the last block",
+                        s.input_beyond_blocks, s.input_short_of_blocks
                     );
-                    s.rows
+                    eprintln!(
+                        "Converted {} requests → {} (expand with `cachesim kv expand`)",
+                        s.requests,
+                        output.display()
+                    );
+                    return Ok(());
                 }
             };
             eprintln!("Converted {count} entries → {}", output.display());
         }
 
+        Command::Kv(KvCommand::Expand {
+            input,
+            output,
+            geometry,
+        }) => {
+            let g = geometry.geometry()?;
+            eprintln!("Expanding request trace …");
+            eprintln!(
+                "  KV bytes/token: {}, state bytes/sequence: {}, tp: {}, mla: {}",
+                g.sizes.kv_bytes_per_token, g.sizes.state_bytes_per_sequence, g.tp, g.sizes.mla
+            );
+            let s = expand_to_parquet(&input, &output, &g, 65_536)?;
+            eprintln!("  {} requests, {} objects", s.requests, s.objects);
+            eprintln!("Expanded to {} entries → {}", s.rows, output.display());
+        }
+
         Command::Info { trace } => {
+            check_object_trace(&trace)?;
             let reader = TraceReader::open(&trace)?;
             let total = reader.total_entries();
 
@@ -574,7 +633,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    fn check(args: &[&str]) -> Result<(), String> {
+    fn convert(args: &[&str]) -> Result<(), String> {
         let cli = Cli::try_parse_from(
             ["cachesim", "convert", "-i", "in", "-o", "out"]
                 .iter()
@@ -591,49 +650,98 @@ mod tests {
 
     #[test]
     fn mooncake_options_are_rejected_for_other_formats() {
+        let err = convert(&["-f", "cache-trace", "--chunk-tokens", "128"]).unwrap_err();
+        assert!(err.contains("--chunk-tokens"), "{err}");
+        assert!(convert(&["-f", "cache-trace"]).is_ok());
+        assert!(convert(&[]).is_ok());
+        assert!(convert(&["-f", "mooncake", "--chunk-tokens", "128"]).is_ok());
+        // Geometry options belong to `kv expand` now.
         for flags in [
             &["--tp", "8"][..],
-            &["--chunk-tokens", "128"],
-            &["--state-mode", "per-chunk"],
-            &["--state-layout", "separate"],
-            &["--kv-dtype", "fp8"],
-            &["--model-name", "x"],
             &["--kv-bytes-per-token", "10"],
-            &["--model-config", "c.json"],
             &["--model", "Qwen/Qwen3-8B"],
         ] {
-            let mut args = vec!["-f", "cache-trace"];
+            let mut args = vec!["-f", "mooncake"];
             args.extend_from_slice(flags);
-            let err = check(&args).unwrap_err();
+            let err = convert(&args).unwrap_err();
             assert!(err.contains(flags[0]), "{flags:?}: {err}");
         }
-        assert!(check(&["-f", "cache-trace"]).is_ok());
-        assert!(check(&[]).is_ok());
-        assert!(check(&["-f", "mooncake", "--kv-bytes-per-token", "10", "--tp", "8"]).is_ok());
+    }
+
+    fn expand_args(args: &[&str]) -> GeometryArgs {
+        let cli = Cli::try_parse_from(
+            ["cachesim", "kv", "expand", "-i", "in", "-o", "out"]
+                .iter()
+                .chain(args),
+        )
+        .unwrap();
+        let Command::Kv(KvCommand::Expand { geometry, .. }) = cli.command else {
+            unreachable!()
+        };
+        geometry
+    }
+
+    #[test]
+    fn request_traces_are_refused_where_objects_are_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = dir.path().join("req.parquet");
+        cachesim::kvtrace::RequestWriter::create(&req, 256, 16)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let err = check_object_trace(&req).unwrap_err().to_string();
+        assert!(err.contains("kv expand"), "{err}");
+        let obj = dir.path().join("obj.parquet");
+        cachesim::trace::TraceWriter::create(&obj, 16)
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert!(check_object_trace(&obj).is_ok());
     }
 
     #[test]
     fn mooncake_defaults() {
         let cli = Cli::try_parse_from([
-            "cachesim",
-            "convert",
-            "-i",
-            "in",
-            "-o",
-            "out",
-            "-f",
-            "mooncake",
-            "--kv-bytes-per-token",
-            "10",
+            "cachesim", "convert", "-i", "in", "-o", "out", "-f", "mooncake",
         ])
         .unwrap();
         let Command::Convert { mooncake, .. } = cli.command else {
             unreachable!()
         };
-        let opts = mooncake.options().unwrap();
-        assert_eq!(opts.chunk_tokens, 256);
-        assert_eq!(opts.tp, 1);
-        assert_eq!(opts.state_mode, StateMode::PerRequest);
-        assert_eq!(opts.state_layout, StateLayout::Combined);
+        assert_eq!(mooncake.options().chunk_tokens, 256);
+    }
+
+    #[test]
+    fn geometry_defaults() {
+        let g = expand_args(&["--kv-bytes-per-token", "10"])
+            .geometry()
+            .unwrap();
+        assert_eq!(g.sizes, ModelSizes::explicit(10, 0));
+        assert_eq!(g.tp, 1);
+        assert_eq!(g.state_mode, StateMode::PerRequest);
+        assert_eq!(g.state_layout, StateLayout::Combined);
+        let g = expand_args(&[
+            "--kv-bytes-per-token",
+            "10",
+            "--state-bytes",
+            "1000",
+            "--tp",
+            "2",
+            "--state-mode",
+            "per-chunk",
+            "--state-layout",
+            "separate",
+            "--model-name",
+            "m",
+        ])
+        .geometry()
+        .unwrap();
+        assert_eq!(g.sizes, ModelSizes::explicit(10, 1000));
+        assert_eq!(g.tp, 2);
+        assert_eq!(g.state_mode, StateMode::PerChunk);
+        assert_eq!(g.state_layout, StateLayout::Separate);
+        assert_eq!(g.model_name.as_deref(), Some("m"));
+        let err = expand_args(&[]).geometry().unwrap_err().to_string();
+        assert!(err.contains("needs one of"), "{err}");
     }
 }

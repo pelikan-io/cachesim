@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cachetrace", "crates/cachesim"]
+members = ["crates/cachetrace", "crates/kvtrace", "crates/cachesim"]
 resolver = "2"
 
 [workspace.package]

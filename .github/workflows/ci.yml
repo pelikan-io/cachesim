@@ -45,6 +45,10 @@ jobs:
       - name: Test cachetrace core (no importers)
         run: cargo test -p cachetrace --no-default-features
 
+      # kvtrace as a load generator depends on it: no HTTP client.
+      - name: Test kvtrace without hf-fetch
+        run: cargo test -p kvtrace --no-default-features
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -72,6 +76,9 @@ jobs:
       - name: Clippy cachetrace core (no importers)
         run: cargo clippy -p cachetrace --all-targets --no-default-features -- -D warnings
 
+      - name: Clippy kvtrace without hf-fetch
+        run: cargo clippy -p kvtrace --all-targets --no-default-features -- -D warnings
+
       - name: cachetrace core has no importer dependencies
         shell: bash
         run: |
@@ -79,6 +86,19 @@ jobs:
           echo "$deps"
           if echo "$deps" | grep -E '^(ahash|zstd) '; then
             echo "cachetrace without the import feature depends on an importer crate" >&2
+            exit 1
+          fi
+
+      - name: kvtrace depends on neither cachetrace nor an HTTP client
+        shell: bash
+        run: |
+          deps=$(cargo tree -p kvtrace --no-default-features -e normal --prefix none)
+          if echo "$deps" | grep -E '^(cachetrace|ureq) '; then
+            echo "kvtrace without hf-fetch depends on cachetrace or ureq" >&2
+            exit 1
+          fi
+          if cargo tree -p kvtrace -e normal --prefix none | grep -E '^cachetrace '; then
+            echo "kvtrace depends on cachetrace" >&2
             exit 1
           fi
 
