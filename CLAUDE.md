@@ -43,13 +43,13 @@ crates/kvtrace/src/objects.rs    ObjectMapper: request chunks → KvObject (obj_
 crates/kvtrace/src/mooncake.rs   Mooncake JSON lines → request trace (full chunks only, chunk_id)
 crates/kvtrace/src/output.rs     plan_output: output refusals, temp file + rename
 crates/kvtrace/src/hf.rs         Hugging Face config.json fetch + cache (feature `hf-fetch`, default on)
-crates/kvtrace/tests/fixtures/   Mooncake trace, model configs
+crates/kvtrace/tests/fixtures/   Mooncake trace, model configs (incl. DeepSeek-V3), a pyarrow-written request trace
 crates/cachesim/src/lib.rs       Policy enums (SegcachePolicy, CuckooPolicy), Error, `pub use cachetrace as trace`, `pub use kvtrace`
 crates/cachesim/src/kv.rs        expand_to_parquet: request trace + Geometry → object-level trace (KV simulation mode goes here)
 crates/cachesim/src/oracle.rs    OracleCache with Belady/BeladySize policies
 crates/cachesim/src/simulator.rs SimConfig/CuckooConfig, simulate_segcache()/simulate_cuckoo()/simulate_oracle(), SimResult
 crates/cachesim/src/main.rs      CLI (clap): simulate, convert, info, kv expand
-crates/cachesim/tests/           api_paths.rs (old `cachesim::trace` paths)
+crates/cachesim/tests/           api_paths.rs (old `cachesim::trace` paths); fixtures/ copies kvtrace fixtures used by kv.rs tests
 ```
 
 ## Architecture
@@ -84,7 +84,7 @@ Each engine has its own config struct, simulation function, and policy enum:
 
 Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `obj_size` (u32), `next_access_vtime` (i64). Optional: `op` (u8), `ttl` (i32). Import from libCacheSim binary or pelikan-io/cache-trace CSV via `convert`.
 
-KV-cache request traces (kvtrace): one row per request with `chunks` list<u64> of full-chunk ids; `chunk_tokens` is file metadata; no object sizes. `convert -f mooncake` writes one; `kv expand` maps it to object rows with a model geometry.
+KV-cache request traces (kvtrace): one row per request with `chunks` list<u64> of full-chunk ids (< 2^48, enforced by the writer); `chunk_tokens` is file metadata; no object sizes; only `session_id` may be null (the reader rejects other nulls). `convert -f mooncake` writes one; `kv expand` maps it to object rows with a model geometry. `ObjectMapper` lists the objects a request writes; prefix reuse rules for hybrid models (resume only at a state-carrying chunk) belong to consumers. Parquet's `snap` feature is on so files from pyarrow (snappy by default) open.
 
 ## Conventions
 
