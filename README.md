@@ -297,31 +297,43 @@ traces without the simulator. `cachesim` re-exports it as `cachesim::trace`,
 so every `cachesim::trace::*` item path from earlier releases still resolves.
 
 The trace functions and `TraceReader`'s iterator now return
-`cachetrace::Error` (`cachesim::trace::Error`), not `cachesim::Error`. The
-one use that is unaffected is `?` on a trace result inside a function whose
-error type is `cachesim::Error` itself, which converts through
-`From<cachesim::trace::Error> for cachesim::Error`. These uses no longer
-compile:
+`cachetrace::Error` (`cachesim::trace::Error`), not `cachesim::Error`.
 
-- Returning a trace result as `Result<_, cachesim::Error>` without `?`, e.g.
-  `fn open(p: &Path) -> Result<TraceReader, cachesim::Error> {
-  TraceReader::open(p) }`, fails with E0308.
-- Collecting the reader into `Result<Vec<TraceEntry>, cachesim::Error>`
-  fails with E0277.
-- `?` on a trace result inside a function whose own error type wraps
-  `cachesim::Error` through `From` (for example a thiserror
-  `#[from] cachesim::Error` variant) fails with E0277: `?` applies one
-  `From` conversion, and there is none from `cachesim::trace::Error` to that
-  type.
-- `cachesim::trace::Error` is a new item, so glob-importing both
-  `cachesim::*` and `cachesim::trace::*` and then naming `Error` is
-  ambiguous (E0659). Name one of them by path.
+The rule: code that writes or infers `cachesim::Error` as the error type of
+a trace result, without a conversion in between, no longer compiles. That
+covers:
 
-The remedy for the first three is `.map_err(cachesim::Error::from)` on the
-trace result, or, for a wrapping error type, an added
-`From<cachesim::trace::Error>` impl. Each case was checked with an
-external crate that compiles against the code before the split and fails as
-listed here against this one.
+- returning a trace result from a function declared to return
+  `Result<_, cachesim::Error>` without `?` (E0308);
+- a `let` annotated `Result<_, cachesim::Error>` (E0308);
+- `match` or `matches!` on `cachesim::Error` variants of a trace result
+  (E0308);
+- combinators that unify error types, such as
+  `Ok::<_, cachesim::Error>(()).and_then(|_| writer.finish())` (E0308);
+- collecting the reader into `Result<_, cachesim::Error>` (E0277);
+- passing the reader where `Iterator<Item = Result<TraceEntry,
+  cachesim::Error>>` is required, including as a
+  `Box<dyn Iterator<...>>` (E0271);
+- `?` in a function whose own error type wraps `cachesim::Error` through
+  `From` (for example a thiserror `#[from] cachesim::Error` variant)
+  (E0277): `?` applies one `From` conversion and there is none from
+  `cachesim::trace::Error` to that type.
+
+Still compiling: `?` into `cachesim::Error`, into `Box<dyn Error>` and into
+anyhow-style error types; `unwrap`, `expect` and `Display` on the error.
+
+Separately, `cachesim::trace::Error` is a new item, so a glob import of
+`cachesim::trace::*` together with any other glob that brings an `Error` into
+scope makes a bare `Error` ambiguous (E0659): `cachesim::*`, `std::fmt::*`, or
+`use super::*` in a test module whose parent defines `Error`. Name the type
+by path.
+
+The remedy for the conversions is `.map_err(cachesim::Error::from)` on the
+trace result (or on each item of the reader), or a
+`From<cachesim::trace::Error>` impl on the caller's own error type. Each case
+above was checked with an external crate that compiles against the code
+before the split and fails as listed against this one; the remedies were
+checked to compile.
 
 - **`TraceEntry`** — one cache request (the in-memory row type).
 - **`trace_schema()`** — the Arrow schema of a trace file.
