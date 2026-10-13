@@ -78,7 +78,7 @@ Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `
 ## Conventions
 
 - Run `cargo fmt` before committing
-- `cargo clippy -- -D warnings` must be clean
+- `cargo clippy --workspace --all-targets -- -D warnings` must be clean (and the `--no-default-features` forms above)
 - Keep README.md in sync with code changes (CLI options, engines, architecture)
 - Policy enums in `lib.rs` mirror upstream crate policies with `From` conversions
 - Errors use `thiserror` with `#[from]` for automatic conversion; one `Error` per crate. A new `cachetrace::Error` variant needs a matching arm in `cachesim`'s `From<cachetrace::Error>`

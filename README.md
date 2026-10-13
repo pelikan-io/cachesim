@@ -314,6 +314,8 @@ covers:
 - passing the reader where `Iterator<Item = Result<TraceEntry,
   cachesim::Error>>` is required, including as a
   `Box<dyn Iterator<...>>` (E0271);
+- `map_err` with a closure or function whose parameter is typed
+  `cachesim::Error`, e.g. `.map_err(|e: cachesim::Error| ...)` (E0631);
 - `?` in a function whose own error type wraps `cachesim::Error` through
   `From` (for example a thiserror `#[from] cachesim::Error` variant)
   (E0277): `?` applies one `From` conversion and there is none from
@@ -321,6 +323,15 @@ covers:
 
 Still compiling: `?` into `cachesim::Error`, into `Box<dyn Error>` and into
 anyhow-style error types; `unwrap`, `expect` and `Display` on the error.
+
+One change shows only at run time. A trace error that reaches
+`Box<dyn Error>` or `anyhow::Error` through `?` is now a
+`cachesim::trace::Error`, so `downcast_ref::<cachesim::Error>()` returns
+`None`, `is::<cachesim::Error>()` is false, and walking `source()` (or
+anyhow's `chain()`) never finds a `cachesim::Error`. The `Display` and
+`Debug` text and the `source()` text are unchanged. Remedies: downcast to
+`cachesim::trace::Error`, or apply `.map_err(cachesim::Error::from)` before
+the type is erased.
 
 Separately, `cachesim::trace::Error` is a new item, so a glob import of
 `cachesim::trace::*` together with any other glob that brings an `Error` into
