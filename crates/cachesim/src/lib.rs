@@ -1,12 +1,13 @@
-#[cfg(feature = "hf-fetch")]
-pub mod hf;
-pub mod mooncake;
+pub mod kv;
 pub mod oracle;
 pub mod simulator;
 
 /// The object-level trace format, now the `cachetrace` crate. Re-exported
 /// here so `cachesim::trace::*` paths from earlier releases keep compiling.
 pub use cachetrace as trace;
+
+/// The request-level KV-cache trace format and model geometry.
+pub use kvtrace;
 
 // ---------------------------------------------------------------------------
 // Cuckoo-cache eviction policies
@@ -113,5 +114,58 @@ impl From<cachetrace::Error> for Error {
             cachetrace::Error::InvalidFormat(m) => Self::InvalidFormat(m),
             other => Self::InvalidFormat(other.to_string()),
         }
+    }
+}
+
+/// Each `kvtrace` error maps to the variant of the same name, carrying the
+/// same source error or message. `kvtrace::Error` is non-exhaustive: a variant
+/// added there later becomes `InvalidFormat` with its message until it gets
+/// an arm here.
+impl From<kvtrace::Error> for Error {
+    fn from(e: kvtrace::Error) -> Self {
+        match e {
+            kvtrace::Error::Io(e) => Self::Io(e),
+            kvtrace::Error::Parquet(e) => Self::Parquet(e),
+            kvtrace::Error::Arrow(e) => Self::Arrow(e),
+            kvtrace::Error::InvalidFormat(m) => Self::InvalidFormat(m),
+            kvtrace::Error::Fetch(m) => Self::Fetch(m),
+            other => Self::InvalidFormat(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant of the trace and kvtrace errors lands in the cachesim
+    /// variant of the same name with its message intact.
+    #[test]
+    fn errors_map_by_variant() {
+        let io = || std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let pq = || parquet::errors::ParquetError::General("pq".into());
+        let ar = || arrow::error::ArrowError::ComputeError("ar".into());
+        let from_trace = [
+            Error::from(cachetrace::Error::Io(io())),
+            Error::from(cachetrace::Error::Parquet(pq())),
+            Error::from(cachetrace::Error::Arrow(ar())),
+            Error::from(cachetrace::Error::InvalidFormat("bad".into())),
+        ];
+        let from_kv = [
+            Error::from(kvtrace::Error::Io(io())),
+            Error::from(kvtrace::Error::Parquet(pq())),
+            Error::from(kvtrace::Error::Arrow(ar())),
+            Error::from(kvtrace::Error::InvalidFormat("bad".into())),
+            Error::from(kvtrace::Error::Fetch("net".into())),
+        ];
+        for errs in [&from_trace[..], &from_kv[..]] {
+            assert!(
+                matches!(&errs[0], Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound && e.to_string() == "gone")
+            );
+            assert!(matches!(&errs[1], Error::Parquet(e) if e.to_string().contains("pq")));
+            assert!(matches!(&errs[2], Error::Arrow(e) if e.to_string().contains("ar")));
+            assert!(matches!(&errs[3], Error::InvalidFormat(m) if m == "bad"));
+        }
+        assert!(matches!(&from_kv[4], Error::Fetch(m) if m == "net"));
     }
 }

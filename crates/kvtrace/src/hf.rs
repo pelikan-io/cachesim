@@ -142,7 +142,7 @@ mod tests {
         // is ignored by default.
         std::env::set_var("HF_HOME", dir.path());
         let bytes = fetch_config("Qwen/Qwen3-8B", "main").unwrap();
-        let sizes = crate::mooncake::ModelSizes::from_config_bytes(&bytes, None).unwrap();
+        let sizes = crate::ModelSizes::from_config_bytes(&bytes, None).unwrap();
         assert_eq!(sizes.kv_bytes_per_token, 147_456);
         let cached = cache_path("Qwen/Qwen3-8B", "main").unwrap();
         assert!(cached.starts_with(dir.path()));
