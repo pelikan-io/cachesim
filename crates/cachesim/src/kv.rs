@@ -28,8 +28,11 @@ pub struct ExpandSummary {
     pub requests: usize,
     /// Distinct object ids.
     pub objects: usize,
-    /// Ids written at more than one size (with the combined state layout a
-    /// chunk's id is written with and without a state snapshot).
+    /// Ids written at more than one size. With the combined state layout a
+    /// chunk's id is written with and without a state snapshot at different
+    /// sizes. That is an artefact of kvtrace's simplified hybrid sizing:
+    /// LMCache writes every chunk object of a hybrid model at one size (see
+    /// the `kvtrace::objects` docs). Zero for dense and MLA models.
     pub multi_size_objects: usize,
 }
 
@@ -44,11 +47,13 @@ pub struct ExpandSummary {
 ///
 /// `obj_size` is the size of this request's write of the object. With the
 /// combined state layout one id is written with and without a state
-/// snapshot, so its rows can carry two sizes; the count of such ids is
+/// snapshot, so its rows can carry two sizes (an artefact of the simplified
+/// hybrid sizing; LMCache uses one size). The count of such ids is
 /// [`ExpandSummary::multi_size_objects`] and `kvtrace.multi_size_objects`.
-/// A write replaces the object, so a store holds the size of the last write
-/// it accepted; a replay that fills only on a miss keeps the size of the
-/// write that missed.
+/// Whether a later write replaces a stored object depends on the store's
+/// write rule (SET or insert-if-absent; see the `kvtrace::objects` docs). A
+/// replay with the object-level engines fills on a miss and keeps the
+/// stored size on a hit.
 ///
 /// The input is read twice: once for the object ids, from which a reverse
 /// scan computes `next_access_vtime` in place (8 bytes per row), and once to

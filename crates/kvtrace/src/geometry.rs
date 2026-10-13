@@ -53,6 +53,34 @@ pub struct ModelSizes {
     /// linear_num_value_heads × linear_value_head_dim`, when known from a
     /// config. Tensor parallelism must divide it.
     pub state_conv_dim: Option<u64>,
+    /// Per-layer page dimensions of a hybrid model, from a config; used only
+    /// to compute vLLM's block size ([`Geometry::vllm_block_size`]).
+    pub hybrid_pages: Option<HybridPages>,
+}
+
+/// Per-layer quantities vLLM uses to size a hybrid model's attention and
+/// recurrent-state pages (all ranks; [`Geometry::vllm_block_size`] splits
+/// them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridPages {
+    /// `num_key_value_heads`.
+    pub kv_heads: u64,
+    /// K and V bytes of one head for one token: `2 × head_dim × KV dtype`.
+    pub kv_head_bytes_per_token: u64,
+    /// Linear-attention convolution width (see
+    /// [`ModelSizes::state_conv_dim`]).
+    pub conv_dim: u64,
+    /// Tokens of convolution state: `linear_conv_kernel_dim - 1` (the
+    /// kernel width defaults to 4 when the config omits it, as the
+    /// Qwen3-Next and Qwen3.5 config classes do).
+    pub conv_state_tokens: u64,
+    /// Bytes per element of the convolution state (the model dtype).
+    pub conv_dtype_bytes: u64,
+    /// `linear_num_value_heads`.
+    pub value_heads: u64,
+    /// Recurrent-state bytes of one value head:
+    /// `linear_key_head_dim × linear_value_head_dim × state dtype`.
+    pub recurrent_bytes_per_value_head: u64,
 }
 
 impl ModelSizes {
@@ -68,6 +96,7 @@ impl ModelSizes {
             state_heads: None,
             attention_heads: None,
             state_conv_dim: None,
+            hybrid_pages: None,
         }
     }
 
@@ -177,6 +206,7 @@ impl ModelSizes {
             dtype_bytes(dtype).ok_or_else(|| bad_config(&format!("unknown dtype {dtype:?}")))?;
 
         let kv_lora_rank = opt_u64(t, "kv_lora_rank")?.filter(|&r| r > 0);
+        let mut kv_head_bytes_per_token = None;
         let kv_bytes_per_token = match kv_lora_rank {
             Some(rank) => {
                 let latent = rank
@@ -191,6 +221,7 @@ impl ModelSizes {
                         .checked_div(req_u64(t, "num_attention_heads")?)
                         .ok_or_else(|| bad_config("num_attention_heads is 0"))?,
                 };
+                kv_head_bytes_per_token = Some(product(&[head_dim, 2, dt])?);
                 product(&[full, req_u64(t, "num_key_value_heads")?, head_dim, 2, dt])?
             }
         };
@@ -213,6 +244,7 @@ impl ModelSizes {
         } else {
             (None, None)
         };
+        let mut state_dtype_bytes = None;
         let state_bytes_per_sequence = if linear > 0 {
             // Without mamba_ssm_dtype the state takes the model dtype. vLLM
             // v0.31 (db9527a), vllm/model_executor/layers/mamba/mamba_utils.py:98-110:
@@ -226,6 +258,7 @@ impl ModelSizes {
                 .unwrap_or(model_dtype);
             let sdt = dtype_bytes(sdtype)
                 .ok_or_else(|| bad_config(&format!("unknown state dtype {sdtype:?}")))?;
+            state_dtype_bytes = Some(sdt);
             product(&[
                 linear,
                 req_u64(t, "linear_num_value_heads")?,
@@ -235,6 +268,33 @@ impl ModelSizes {
             ])?
         } else {
             0
+        };
+
+        let hybrid_pages = match (
+            kv_heads,
+            kv_head_bytes_per_token,
+            state_conv_dim,
+            state_dtype_bytes,
+        ) {
+            (Some(kv_heads), Some(kv_head_bytes_per_token), Some(conv_dim), Some(sdt)) => {
+                let kernel = opt_u64(t, "linear_conv_kernel_dim")?.unwrap_or(4);
+                let conv_dtype_bytes = dtype_bytes(model_dtype)
+                    .ok_or_else(|| bad_config(&format!("unknown dtype {model_dtype:?}")))?;
+                Some(HybridPages {
+                    kv_heads,
+                    kv_head_bytes_per_token,
+                    conv_dim,
+                    conv_state_tokens: kernel.saturating_sub(1),
+                    conv_dtype_bytes,
+                    value_heads: req_u64(t, "linear_num_value_heads")?,
+                    recurrent_bytes_per_value_head: product(&[
+                        req_u64(t, "linear_key_head_dim")?,
+                        req_u64(t, "linear_value_head_dim")?,
+                        sdt,
+                    ])?,
+                })
+            }
+            _ => None,
         };
 
         Ok(Self {
@@ -247,6 +307,7 @@ impl ModelSizes {
             state_heads,
             attention_heads,
             state_conv_dim,
+            hybrid_pages,
         })
     }
 }
@@ -288,7 +349,9 @@ fn bad_config(msg: &str) -> Error {
 /// When a hybrid model's recurrent-state snapshot is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateMode {
-    /// One snapshot at each request's last chunk.
+    /// One snapshot at each request's last chunk. vLLM snapshots at the
+    /// last block boundary of each scheduler step, so a prompt longer than
+    /// `max_num_batched_tokens` gets several; this mode understates them.
     PerRequest,
     /// A snapshot at every chunk.
     PerChunk,
@@ -383,6 +446,49 @@ impl Geometry {
             state_mode: StateMode::PerRequest,
             state_layout: StateLayout::Combined,
         }
+    }
+
+    /// The attention block size, in tokens, that vLLM v0.31 (db9527a) uses
+    /// for this hybrid model at this TP degree with prefix caching on
+    /// ("align" mode), or `None` for a model without recurrent state or
+    /// without [`ModelSizes::hybrid_pages`]. LMCache requires its chunk
+    /// size to be a multiple of it (`kv_layer_groups.py:750-755`).
+    ///
+    /// `vllm/platforms/interface.py:960-994`: vLLM raises the block size
+    /// until one layer's attention page is at least one layer's recurrent
+    /// (mamba) page:
+    ///
+    /// * attention page per token = KV heads per rank (`max(1, kv_heads /
+    ///   tp)`, `config/model.py` `get_num_kv_heads`) × 2 × head_dim × KV
+    ///   dtype (`FullAttentionSpec` with `block_size = 1`);
+    /// * mamba page = convolution state `(conv_dim / tp) × (kernel - 1)` in
+    ///   the model dtype plus recurrent state `(value_heads / tp) ×
+    ///   key_head_dim × value_head_dim` in the state dtype
+    ///   (`mamba_utils.py:279-300`, `MambaSpec.page_size_bytes`);
+    /// * block = `align × ceil(mamba_page / (align × attention_page_per_token))`,
+    ///   where `align` is the attention backend's kernel block alignment
+    ///   (`kernel_alignment`; 16 for FlashAttention's `MultipleOf(16)` and
+    ///   vLLM's default 16-token block), and never below `kernel_alignment`.
+    ///
+    /// Backends with a larger kernel page (for example FlashAttention 4's
+    /// head-dim-256 kernel on some GPUs) give a larger block.
+    pub fn vllm_block_size(&self, kernel_alignment: u64) -> Option<u64> {
+        let p = self.sizes.hybrid_pages?;
+        if self.sizes.state_bytes_per_sequence == 0 || self.sizes.mla || kernel_alignment == 0 {
+            return None;
+        }
+        let tp = self.tp.max(1);
+        let attn_per_token = (p.kv_heads / tp)
+            .max(1)
+            .checked_mul(p.kv_head_bytes_per_token)?;
+        let conv = (p.conv_dim / tp)
+            .checked_mul(p.conv_state_tokens)?
+            .checked_mul(p.conv_dtype_bytes)?;
+        let recurrent = (p.value_heads / tp).checked_mul(p.recurrent_bytes_per_value_head)?;
+        let mamba_page = conv.checked_add(recurrent)?;
+        let per_block = kernel_alignment.checked_mul(attn_per_token)?;
+        let blocks = mamba_page.div_ceil(per_block);
+        Some(kernel_alignment.checked_mul(blocks)?.max(kernel_alignment))
     }
 
     /// Objects per chunk and the per-rank sizes; see [the type
@@ -748,6 +854,57 @@ mod tests {
         g.tp = 3;
         let err = g.sharding().unwrap_err().to_string();
         assert!(err.contains("128 attention heads"), "{err}");
+    }
+
+    /// vLLM's align-mode block size, worked by hand from the fixtures with
+    /// a 16-token kernel alignment:
+    ///
+    /// Qwen3-Next-80B (2 KV heads, head_dim 256, bf16; 16 key and 32 value
+    /// heads of 128, conv kernel 4, bf16 state):
+    /// * tp 1: attention 2 × 2 × 256 × 2 = 2,048 B/token; conv (2·16·128 +
+    ///   32·128 = 8,192) × 3 × 2 = 49,152; recurrent 32 × 128 × 128 × 2 =
+    ///   1,048,576; page 1,097,728; ceil(1,097,728 / (16 × 2,048)) = 34
+    ///   → 544 tokens.
+    /// * tp 4: attention max(1, 2/4) = 1 head → 1,024 B/token; conv 2,048 ×
+    ///   3 × 2 = 12,288; recurrent 8 × 32,768 = 262,144; page 274,432;
+    ///   ceil(274,432 / 16,384) = 17 → 272 tokens.
+    ///
+    /// Qwen3.8-27B (4 KV heads, head_dim 256, bf16; 16 key and 48 value
+    /// heads of 128, fp32 state):
+    /// * tp 8: attention 1 head → 1,024 B/token; conv (4,096 + 6,144) / 8 ×
+    ///   3 × 2 = 7,680; recurrent 6 × 128 × 128 × 4 = 393,216; page 400,896;
+    ///   ceil(400,896 / 16,384) = 25 → 400 tokens.
+    /// * tp 1: attention 4,096 B/token; conv 61,440; recurrent 3,145,728;
+    ///   page 3,207,168; ceil(3,207,168 / 65,536) = 49 → 784 tokens.
+    #[test]
+    fn vllm_block_size_for_hybrids() {
+        let next = ModelSizes::from_config_file(fixture("qwen3-next-80b-a3b.json"), None).unwrap();
+        let p = next.hybrid_pages.unwrap();
+        assert_eq!(
+            (p.kv_head_bytes_per_token, p.conv_dim, p.conv_state_tokens),
+            (1_024, 8_192, 3)
+        );
+        let mut g = Geometry::new(next);
+        assert_eq!(g.vllm_block_size(16), Some(544));
+        g.tp = 4;
+        assert_eq!(g.vllm_block_size(16), Some(272));
+
+        let mut g = qwen3_8_27b(8);
+        assert_eq!(g.vllm_block_size(16), Some(400));
+        g.tp = 1;
+        assert_eq!(g.vllm_block_size(16), Some(784));
+
+        // Dense, MLA and explicit sizes have no hybrid block size.
+        let dense =
+            Geometry::new(ModelSizes::from_config_file(fixture("qwen3-8b.json"), None).unwrap());
+        assert_eq!(dense.vllm_block_size(16), None);
+        let ds =
+            Geometry::new(ModelSizes::from_config_file(fixture("deepseek-v3.json"), None).unwrap());
+        assert_eq!(ds.vllm_block_size(16), None);
+        assert_eq!(
+            Geometry::new(ModelSizes::explicit(10, 1000)).vllm_block_size(16),
+            None
+        );
     }
 
     #[test]

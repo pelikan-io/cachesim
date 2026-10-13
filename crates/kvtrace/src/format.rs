@@ -719,6 +719,19 @@ mod tests {
         assert!(r.next().is_none());
     }
 
+    /// pyarrow 21, `compression="gzip"`, one request. The footer is not
+    /// compressed, so the file opens; the first batch needs the gzip codec,
+    /// which is not built in.
+    #[test]
+    fn gzip_file_fails_at_first_batch() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/requests/pyarrow-gzip.parquet");
+        let mut r = RequestReader::open(&path).unwrap();
+        assert_eq!(r.total_requests(), 1);
+        let err = r.next().unwrap().unwrap_err().to_string();
+        assert!(err.contains("Disabled feature at compile time"), "{err}");
+    }
+
     #[test]
     fn snappy_files_are_read() {
         let dir = tempfile::tempdir().unwrap();

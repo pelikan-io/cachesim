@@ -238,6 +238,28 @@ fn moved_geometry_option(args: impl IntoIterator<Item = String>) -> Option<Strin
     ))
 }
 
+/// Kernel block alignment assumed for vLLM's hybrid block size: the
+/// FlashAttention backend's `MultipleOf(16)` and vLLM's default 16-token
+/// block.
+const VLLM_KERNEL_ALIGNMENT: u64 = 16;
+
+/// A warning when a hybrid model's chunk length is not a multiple of the
+/// block size vLLM would use, which LMCache requires.
+fn chunk_size_warning(g: &Geometry, chunk_tokens: u64) -> Option<String> {
+    let block = g.vllm_block_size(VLLM_KERNEL_ALIGNMENT)?;
+    if chunk_tokens.is_multiple_of(block) {
+        return None;
+    }
+    Some(format!(
+        "warning: chunk_tokens {chunk_tokens} is not a multiple of {block}, the attention \
+         block size vLLM uses for this hybrid model at tp {} with prefix caching \
+         ({VLLM_KERNEL_ALIGNMENT}-token kernel alignment). LMCache requires the chunk size to \
+         be a multiple of the block size, so the smallest valid chunk is {block} tokens. \
+         Objects are sized for {chunk_tokens}-token chunks anyway.",
+        g.tp
+    ))
+}
+
 /// Reject Mooncake options given with another input format.
 fn check_format_options(format: &InputFormatArg, mooncake: &MooncakeArgs) -> Result<(), String> {
     if matches!(format, InputFormatArg::Mooncake) || mooncake.chunk_tokens.is_none() {
@@ -620,6 +642,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             let g = geometry.geometry()?;
             eprintln!("Expanding request trace …");
+            let chunk_tokens = cachesim::kvtrace::RequestReader::open(&input)?.chunk_tokens();
+            if let Some(w) = chunk_size_warning(&g, u64::from(chunk_tokens)) {
+                eprintln!("{w}");
+            }
             eprintln!(
                 "  KV bytes/token: {}, state bytes/sequence: {}, tp: {}, mla: {}",
                 g.sizes.kv_bytes_per_token, g.sizes.state_bytes_per_sequence, g.tp, g.sizes.mla
@@ -776,6 +802,31 @@ mod tests {
         }
         assert!(moved_geometry_option(args(&["convert", "-f", "mooncake"])).is_none());
         assert!(moved_geometry_option(args(&["kv", "expand", "--tp", "8"])).is_none());
+    }
+
+    #[test]
+    fn hybrid_chunk_size_warning() {
+        let cfg = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/models/qwen3.8-27b.json"
+        );
+        let mut g = expand_args(&["--model-config", cfg, "--tp", "8"])
+            .geometry()
+            .unwrap();
+        let w = chunk_size_warning(&g, 256).unwrap();
+        assert!(
+            w.contains("chunk_tokens 256 is not a multiple of 400")
+                && w.contains("smallest valid chunk is 400 tokens"),
+            "{w}"
+        );
+        assert!(chunk_size_warning(&g, 800).is_none());
+        g.tp = 1;
+        assert!(chunk_size_warning(&g, 256).unwrap().contains("784"));
+        // Dense: no warning.
+        let g = expand_args(&["--kv-bytes-per-token", "10"])
+            .geometry()
+            .unwrap();
+        assert!(chunk_size_warning(&g, 256).is_none());
     }
 
     #[test]

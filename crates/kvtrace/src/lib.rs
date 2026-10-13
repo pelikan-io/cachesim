@@ -15,6 +15,10 @@
 //!   format.
 //! * `hf` (feature `hf-fetch`, on by default): fetch a model's `config.json`
 //!   from Hugging Face. Without the feature the crate has no HTTP client.
+//!
+//! Dense and MLA geometry is checked against vLLM and LMCache. Hybrid
+//! (linear-attention) geometry is an approximation pending a follow-up; the
+//! known differences are listed in the [`objects`] module docs.
 
 pub mod format;
 pub mod geometry;

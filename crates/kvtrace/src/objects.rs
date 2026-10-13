@@ -25,16 +25,45 @@
 //!   and it stores the full latent (`save_only_first_rank`,
 //!   `cache_engine.py:116-119`).
 //!
+//! Dense and MLA geometry (sizes, TP split, first-rank-only MLA) follows
+//! vLLM and LMCache as cited. Hybrid geometry is an approximation pending a
+//! follow-up; the known differences are listed under "Hybrid models".
+//!
 //! # Hybrid models
 //!
 //! Linear-attention layers keep a fixed-size recurrent state per sequence
-//! instead of per-token KV. vLLM v0.31 snapshots that state only at some
-//! block boundaries when prefix caching is on ("align" mode,
-//! `vllm/config/cache.py:190-198`), so [`StateMode::PerRequest`] (one
-//! snapshot at the request's last chunk) is the default and
-//! [`StateMode::PerChunk`] is the upper bound. vLLM pads the state page to
-//! the attention page size (`platforms/interface.py:1006-1009`); that padding
-//! is not modelled. Convolution state is ignored.
+//! instead of per-token KV. [`StateMode::PerRequest`] stores one snapshot at
+//! each request's last chunk (the default) and [`StateMode::PerChunk`] one at
+//! every chunk (the upper bound). [`StateLayout::Combined`] adds the state
+//! bytes to the chunk's object; [`StateLayout::Separate`] stores the state as
+//! its own object. Convolution state is not counted in the object sizes.
+//!
+//! This is a simplified model, not LMCache v0.5.5's layout. Known
+//! differences:
+//!
+//! * Sizes, combined layout: LMCache writes every chunk object at one size,
+//!   the attention pages plus the recurrent pages for the whole chunk, with
+//!   null pages where no snapshot was taken
+//!   (`multiprocess/modules/lmcache_driven_transfer.py:66-93`
+//!   `get_layout_desc`, `platform/cache_context.py:228`). Here a chunk
+//!   without a snapshot is written at KV size only and a chunk with one at
+//!   KV plus one state, so the same id is written at two sizes and the
+//!   KV-only writes are smaller than LMCache's.
+//! * Chunk length: with prefix caching vLLM ("align" mode) raises the
+//!   attention block size until one layer's attention page is at least one
+//!   layer's recurrent page (`vllm/platforms/interface.py:960-994`;
+//!   [`Geometry::vllm_block_size`]), and LMCache requires the chunk size to
+//!   be a multiple of the block size (`kv_layer_groups.py:750-755`). For the
+//!   hybrid models this crate's tests use, that rules out 256-token chunks.
+//!   At a valid chunk of k blocks, each recurrent object holds k pages per
+//!   linear layer, each padded to the attention page size
+//!   (`platforms/interface.py:1006-1009`); this model has one unpadded
+//!   snapshot per object.
+//! * Snapshot count: vLLM's align mode snapshots the state at the last
+//!   block boundary of each scheduler step (`vllm/config/cache.py:190-198`),
+//!   so a prompt longer than `max_num_batched_tokens` gets several
+//!   snapshots. [`StateMode::PerRequest`] models one per request and so
+//!   understates snapshots for long prompts.
 //!
 //! # Object ids
 //!
@@ -42,37 +71,66 @@
 //! `chunk << 16 | slot << 12 | rank` ([`obj_id`]).
 //!
 //! * [`StateLayout::Combined`]: with `separate_object_groups` off (the
-//!   default), LMCache keeps a chunk's attention and state pages in a single
-//!   object group, stored as one object keyed by the chunk
-//!   (`kv_layer_groups.py:682-687`). So a chunk has one id per rank, slot 0,
-//!   whether or not a write carries state. A write with a state snapshot
+//!   default), LMCache has one object group per chunk, stored as one object
+//!   keyed by the chunk (`kv_layer_groups.py:682-687`). So a chunk has one id
+//!   per rank, slot 0, whether or not a write carries state. Because of the
+//!   simplified sizing above, a write with a snapshot
 //!   ([`ObjectKind::KvWithState`]) is larger than one without
-//!   ([`ObjectKind::Kv`]), so the same id can be written at two sizes. A
-//!   write replaces the object: the store holds the size of the last write.
+//!   ([`ObjectKind::Kv`]), and the same id can be written at two sizes.
 //! * [`StateLayout::Separate`]: the state is its own object under its own
 //!   key, slot 1 ([`ObjectKind::State`]); the chunk's KV object keeps slot 0.
 //!
 //! [`ObjectKind`] says what a write holds; it is not part of the id except
 //! that a separate state object has its own slot ([`ObjectKind::key_slot`]).
 //!
-//! # Writes, not reuse
+//! # Writes
 //!
 //! [`ObjectMapper::objects`] lists the objects a request writes: every chunk
-//! of its prefix. A replay that stores only on a miss writes just the ones
-//! it missed. Which stored objects a later request can reuse is the
-//! consumer's rule, not this module's. For a model without recurrent state,
-//! any prefix of chunks found in the store is usable. For a hybrid model, a
-//! prefix hit is usable only through the last chunk whose stored object
-//! carries state: the linear-attention layers need the state where
-//! computation resumes, so a prefix that ends at a KV-only chunk cannot be
-//! resumed from. [`ObjectMapper::lookup_ids`] gives the ids to probe at a
-//! chunk:
+//! of its prefix. Which of those a store actually accepts depends on its
+//! write rule, and LMCache has two:
 //!
-//! * Combined: the one id. Whether the object stored there carries state
-//!   depends on the write that stored it, so the consumer must remember it
-//!   (the [`KvObject::kind`] of that write, [`ObjectKind::carries_state`]).
-//! * Separate: the KV id, and the state id; the chunk is resumable when the
-//!   state id is present.
+//! * Insert-if-absent: the multiprocess store reserves only keys that are
+//!   not present (`reserve_write(..., "new")`,
+//!   `distributed/storage_manager.py:182-200`, `l1_manager.py:455-458`; called
+//!   from `multiprocess/modules/lmcache_driven_transfer.py:1212-1214` and
+//!   `server_transfer.py:213-215`).
+//! * SET: the in-process remote backends put every object they are given,
+//!   without checking whether the store holds the key
+//!   (`storage_backend/remote_backend.py:263-270`, `323-331`). The tests
+//!   here model this as a SET of every chunk after the lookup's prefix hit.
+//!
+//! Under SET the combined layout can lose a stored snapshot: a later request
+//! that writes the same chunk without a snapshot replaces the
+//! state-carrying object. Example, per-request state: A = [1, 2, 3] is
+//! stored, chunk 2 is evicted, B = [1, 2, 3, 4] misses at chunk 2 and
+//! writes chunks 2-4, which replaces chunk 3's object with a KV-only one; a
+//! repeat of A then reuses nothing under SET and 3 chunks under
+//! insert-if-absent. The separate layout keeps chunk 3's state object either
+//! way. Chunks that are present but not resumable are not rewritten under
+//! SET (they are inside the prefix hit); under insert-if-absent only absent
+//! keys are written, so the separate layout can add a snapshot to such a
+//! chunk and the combined layout cannot (A = [1, 2, 3], then [1, 2] twice:
+//! the second [1, 2] reuses 2 chunks only with separate, insert-if-absent).
+//!
+//! # Reuse
+//!
+//! Which stored objects a later request can reuse is the consumer's rule,
+//! not this module's:
+//!
+//! * A chunk counts as present only if every storing rank's object is
+//!   present: the usable prefix is the minimum over ranks. MLA models have
+//!   one storing rank (the first), so only rank 0 is looked up.
+//! * For a model without recurrent state, the whole present prefix is
+//!   usable.
+//! * For a hybrid model, a prefix is usable only through the last present
+//!   chunk whose stored object carries state: the linear-attention layers
+//!   need the state where computation resumes, so a prefix that ends at a
+//!   KV-only chunk cannot be resumed from. [`ObjectMapper::lookup_ids`] gives
+//!   the ids to probe at a chunk. Combined: the one id; whether the object
+//!   stored there carries state depends on the write that stored it, so the
+//!   consumer must remember it ([`KvObject::kind`],
+//!   [`ObjectKind::carries_state`]). Separate: the KV id and the state id;
+//!   the chunk is resumable when the state id is present.
 //!
 //! Under [`StateMode::PerRequest`] a request's snapshot sits on its own last
 //! chunk, so a later request with a longer prompt can resume through that
@@ -109,7 +167,7 @@ impl ObjectKind {
     /// ([`State`](Self::State) or [`KvWithState`](Self::KvWithState)). For a
     /// hybrid model, a cached prefix can be resumed only at a chunk whose
     /// stored object carries state; see the
-    /// [module docs](self#writes-not-reuse).
+    /// [module docs](self#reuse).
     pub fn carries_state(self) -> bool {
         matches!(self, Self::State | Self::KvWithState)
     }
@@ -251,7 +309,7 @@ impl ObjectMapper {
     /// the combined layout the consumer knows that from the write that
     /// stored [`LookupIds::object`]; with the separate layout
     /// [`LookupIds::state`] must be present. See the
-    /// [module docs](self#writes-not-reuse).
+    /// [module docs](self#reuse).
     ///
     /// Errors if `chunk` does not fit 48 bits or `rank` is not a storing
     /// rank.
@@ -622,8 +680,8 @@ mod tests {
     /// A consumer's store: the last write to each id.
     type Store = std::collections::HashMap<u64, KvObject>;
 
-    /// Store every object a request writes that is not already present (a
-    /// replay that fills on a miss).
+    /// Store every object a request writes whose key is absent
+    /// (insert-if-absent, LMCache's MP store `reserve_write(..., "new")`).
     fn fill(store: &mut Store, m: &ObjectMapper, chunks: &[u64]) {
         for o in m.objects(chunks).unwrap() {
             store.entry(o.obj_id).or_insert(o);
@@ -682,8 +740,10 @@ mod tests {
                     StateMode::PerRequest => assert_eq!(diverging, None, "{case}"),
                     StateMode::PerChunk => assert_eq!(diverging, Some(1), "{case}"),
                 }
-                // B's fill on miss adds only chunk 4; A's state-carrying
-                // object at chunk 3 is kept.
+                // Under insert-if-absent B's fill adds only chunk 4, so A's
+                // state-carrying object at chunk 3 is kept. Under
+                // SET-from-miss it can be lost; see
+                // set_from_miss_can_lose_a_snapshot.
                 fill(&mut store, &m, &[1, 2, 3, 4]);
                 assert_eq!(resume_through(&store, &m, &[1, 2, 3]), Some(2), "{case}");
             }
@@ -694,6 +754,128 @@ mod tests {
         let mut store = Store::new();
         fill(&mut store, &m, &[1, 2, 3]);
         assert_eq!(resume_through(&store, &m, &[1, 2, 4]), Some(1));
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WriteRule {
+        /// Unconditional SET of the objects after the lookup's prefix hit
+        /// (LMCache's remote backends).
+        SetFromMiss,
+        /// Write every object whose key is absent (LMCache's MP store).
+        InsertIfAbsent,
+    }
+
+    /// Run one request against `store`: look up the prefix (a chunk counts
+    /// only if every storing rank's object is present), find how many chunks
+    /// can be reused (for a hybrid model, through the last chunk whose stored
+    /// object carries state), then write under `rule`. Returns the reused
+    /// chunk count.
+    fn run(store: &mut Store, m: &ObjectMapper, chunks: &[u64], rule: WriteRule) -> usize {
+        let mut prefix = 0;
+        for &c in chunks {
+            let all = (0..m.sharding().ranks)
+                .all(|r| store.contains_key(&m.lookup_ids(c, r).unwrap().object));
+            if !all {
+                break;
+            }
+            prefix += 1;
+        }
+        let reused = resume_through(store, m, &chunks[..prefix]).map_or(0, |i| i + 1);
+        for o in m.objects(chunks).unwrap() {
+            match rule {
+                WriteRule::SetFromMiss => {
+                    if o.chunk_index as usize >= prefix {
+                        store.insert(o.obj_id, o);
+                    }
+                }
+                WriteRule::InsertIfAbsent => {
+                    store.entry(o.obj_id).or_insert(o);
+                }
+            }
+        }
+        reused
+    }
+
+    fn hybrid(layout: StateLayout) -> ObjectMapper {
+        let mut g = Geometry::new(ModelSizes::explicit(10, 1000));
+        g.tp = 2;
+        g.state_layout = layout;
+        ObjectMapper::new(&g, 256).unwrap()
+    }
+
+    /// A = [1, 2, 3]; chunk 2 is evicted; B = [1, 2, 3, 4] runs; then A
+    /// again. Per-request state. Under SET-from-miss with the combined layout
+    /// B's KV-only write of chunk 3 replaces A's state-carrying object, and
+    /// A reuses nothing; under insert-if-absent A reuses all 3 chunks (768
+    /// tokens). The separate layout keeps A's state object either way.
+    #[test]
+    fn set_from_miss_can_lose_a_snapshot() {
+        for (layout, rule, want) in [
+            (StateLayout::Combined, WriteRule::SetFromMiss, 0),
+            (StateLayout::Combined, WriteRule::InsertIfAbsent, 3),
+            (StateLayout::Separate, WriteRule::SetFromMiss, 3),
+            (StateLayout::Separate, WriteRule::InsertIfAbsent, 3),
+        ] {
+            let m = hybrid(layout);
+            let mut store = Store::new();
+            assert_eq!(run(&mut store, &m, &[1, 2, 3], rule), 0);
+            store.retain(|&id, _| obj_id_fields(id).0 != 2);
+            assert_eq!(run(&mut store, &m, &[1, 2, 3, 4], rule), 0);
+            assert_eq!(
+                run(&mut store, &m, &[1, 2, 3], rule),
+                want,
+                "{layout:?} {rule:?}"
+            );
+        }
+    }
+
+    /// A = [1, 2, 3], then [1, 2] twice, per-request state. [1, 2] finds
+    /// both chunks present but not resumable. Under SET-from-miss nothing
+    /// past the prefix hit is written, so it never reuses anything. Under
+    /// insert-if-absent the separate layout stores the state object at chunk
+    /// 2 (its key is new), so the second [1, 2] reuses 2 chunks (512
+    /// tokens); with the combined layout chunk 2's key already exists, so the
+    /// snapshot is never stored.
+    #[test]
+    fn present_but_not_resumable_chunks() {
+        for (layout, rule, want) in [
+            (StateLayout::Combined, WriteRule::SetFromMiss, 0),
+            (StateLayout::Combined, WriteRule::InsertIfAbsent, 0),
+            (StateLayout::Separate, WriteRule::SetFromMiss, 0),
+            (StateLayout::Separate, WriteRule::InsertIfAbsent, 2),
+        ] {
+            let m = hybrid(layout);
+            let mut store = Store::new();
+            run(&mut store, &m, &[1, 2, 3], rule);
+            assert_eq!(run(&mut store, &m, &[1, 2], rule), 0, "{layout:?} {rule:?}");
+            assert_eq!(
+                run(&mut store, &m, &[1, 2], rule),
+                want,
+                "{layout:?} {rule:?}"
+            );
+        }
+    }
+
+    /// A chunk counts only if every storing rank's object is present.
+    #[test]
+    fn a_missing_rank_ends_the_prefix() {
+        let m = hybrid(StateLayout::Combined);
+        let mut store = Store::new();
+        run(&mut store, &m, &[1, 2, 3], WriteRule::InsertIfAbsent);
+        assert_eq!(
+            run(&mut store, &m, &[1, 2, 3], WriteRule::InsertIfAbsent),
+            3
+        );
+        store.remove(&obj_id(3, ObjectKind::Kv, 1).unwrap());
+        // Chunk 3 is missing on rank 1, and chunks 1-2 carry no state.
+        assert_eq!(run(&mut store, &m, &[1, 2, 3], WriteRule::SetFromMiss), 0);
+        // MLA: one storing rank, so rank 1 is not a lookup rank.
+        let mut g = Geometry::new(ModelSizes::explicit(12, 0));
+        g.tp = 4;
+        g.sizes.mla = true;
+        let m = ObjectMapper::new(&g, 256).unwrap();
+        assert!(m.lookup_ids(1, 0).is_ok());
+        assert!(m.lookup_ids(1, 1).is_err());
     }
 
     /// With the combined layout, one id is written with and without state.
