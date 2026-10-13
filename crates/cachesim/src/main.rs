@@ -625,7 +625,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 g.sizes.kv_bytes_per_token, g.sizes.state_bytes_per_sequence, g.tp, g.sizes.mla
             );
             let s = expand_to_parquet(&input, &output, &g, 65_536)?;
-            eprintln!("  {} requests, {} objects", s.requests, s.objects);
+            eprintln!(
+                "  {} requests, {} objects, {} written at more than one size",
+                s.requests, s.objects, s.multi_size_objects
+            );
             eprintln!("Expanded to {} entries → {}", s.rows, output.display());
         }
 

@@ -28,25 +28,25 @@
 //!   `kvtrace.converter.input_short_of_blocks`.
 //!
 //! Chunks are counted from `hash_ids`, as above, in both cases.
+//! `input_tokens` is `input_length` as given, `output_tokens` is
+//! `output_length`, `req_id` is the request's 0-based index among the
+//! non-empty input lines, and `session_id` is null.
 //!
 //! # One prefix, two chunk ids
 //!
 //! A Mooncake hash id covers a whole block, so a partial last block and the
 //! full block that later extends it have different ids even when their first
-//! tokens agree. When a request's last block is partial with at least
-//! `chunk_tokens` tokens, its full sub-chunk 0 is keyed on the partial
-//! block's id; a later request with the same prefix that holds the block in
-//! full reads that sub-chunk under the full block's id. LMCache, which keys a
-//! chunk on the token prefix, would hit; the converted trace misses, so
-//! prefix reuse is undercounted. The trace cannot show whether the tokens
-//! agree, so this is an upper bound. On the public Mooncake traces at 256
-//! tokens per chunk, later full-chunk reads of a block position where an
-//! earlier request with the same prefix stored a partial block under another
-//! id: conversation 14,844 of 559,542 (2.7%), toolagent 21,254 of 782,217
-//! (2.7%), synthetic 3,001 of 237,347 (1.3%).
-//! `input_tokens` is `input_length` as given, `output_tokens` is
-//! `output_length`, `req_id` is the request's 0-based index among the
-//! non-empty input lines, and `session_id` is null.
+//! tokens agree. Every full sub-chunk of a partial last block is keyed on
+//! that partial block's id. A later request with the same prefix that holds
+//! the block in full reads the same token positions under the full block's
+//! id. LMCache, which keys a chunk on the token prefix, would hit; the
+//! converted trace misses, so prefix reuse is undercounted. The trace cannot
+//! show whether the tokens agree, so the count is an upper bound. At 256
+//! tokens per chunk only sub-chunk 0 of such a block is full, and the
+//! affected later reads on the public Mooncake traces are: conversation
+//! 14,844 of 559,542 full-chunk reads (2.7%), toolagent 21,254 of 782,217
+//! (2.7%), synthetic 3,001 of 237,347 (1.3%). Smaller chunks give more
+//! affected sub-chunks per block.
 //!
 //! # Input and output
 //!

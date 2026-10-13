@@ -10,9 +10,10 @@
 //! | `session_id`    | `UInt64`                | yes      | Session, for sources that need reconstruction |
 //!
 //! Chunk ids must be below 2^48 because an object id packs the chunk id with
-//! an object kind and a tensor-parallel rank in 64 bits
-//! (`chunk << 16 | kind << 12 | rank`, [`obj_id`](crate::obj_id));
-//! [`RequestWriter::write`] rejects larger ids. No column may be null except
+//! a key slot and a tensor-parallel rank in 64 bits
+//! (`chunk << 16 | slot << 12 | rank`, [`obj_id`](crate::obj_id));
+//! [`RequestWriter::write`] rejects larger ids, and [`RequestReader`] rejects
+//! them naming the file, row and `req_id`. No column may be null except
 //! `session_id`; [`RequestReader`] rejects a batch with nulls elsewhere.
 //!
 //! Equal chunk ids mean equal prefix content. Every chunk covers the same
@@ -235,6 +236,10 @@ pub struct RequestReader {
     current: Option<Columns>,
     row_idx: usize,
     failed: bool,
+    /// For error messages.
+    path: std::path::PathBuf,
+    /// Rows returned so far, for error messages.
+    rows_read: u64,
 }
 
 struct Columns {
@@ -368,6 +373,8 @@ impl RequestReader {
             current: None,
             row_idx: 0,
             failed: false,
+            path: path.to_path_buf(),
+            rows_read: 0,
         })
     }
 
@@ -422,14 +429,37 @@ impl Iterator for RequestReader {
                 Ok(false) => return None,
                 Err(e) => {
                     self.failed = true;
-                    return Some(Err(e));
+                    return Some(Err(match e {
+                        Error::InvalidFormat(m) => Error::InvalidFormat(format!(
+                            "{}: batch after row {}: {m}",
+                            self.path.display(),
+                            self.rows_read
+                        )),
+                        e => e,
+                    }));
                 }
             }
         }
         let cols = self.current.as_ref()?;
         let i = self.row_idx;
         self.row_idx += 1;
-        Some(Ok(cols.request(i)))
+        let req = cols.request(i);
+        let row = self.rows_read;
+        self.rows_read += 1;
+        if let Some(&c) = req
+            .chunks
+            .iter()
+            .find(|&&c| c >= 1 << crate::objects::CHUNK_ID_BITS)
+        {
+            self.failed = true;
+            return Some(Err(Error::InvalidFormat(format!(
+                "{}: row {row} (req_id {}) has chunk id {c}, which is not below 2^{}",
+                self.path.display(),
+                req.req_id,
+                crate::objects::CHUNK_ID_BITS
+            ))));
+        }
+        Some(Ok(req))
     }
 }
 
@@ -654,10 +684,39 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains(&format!("column {col} has 1 null")),
+                err.contains(&format!("column {col} has 1 null"))
+                    && err.contains(&format!("{col}.parquet")),
                 "{col}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn reader_rejects_chunk_ids_of_2_pow_48() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.parquet");
+        let mut a = arrays(None);
+        let mut chunks = ListBuilder::new(UInt64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::UInt64,
+            true,
+        )));
+        chunks.values().append_slice(&[1, (1 << 48) - 1]);
+        chunks.append(true);
+        chunks.values().append_slice(&[2, 1 << 48]);
+        chunks.append(true);
+        a[4] = Arc::new(chunks.finish());
+        write_nullable(&path, Compression::UNCOMPRESSED, a);
+        let mut r = RequestReader::open(&path).unwrap();
+        assert_eq!(r.next().unwrap().unwrap().chunks, [1, (1 << 48) - 1]);
+        let err = r.next().unwrap().unwrap_err().to_string();
+        assert!(
+            err.contains("big.parquet")
+                && err.contains("row 1 (req_id 1)")
+                && err.contains("281474976710656"),
+            "{err}"
+        );
+        assert!(r.next().is_none());
     }
 
     #[test]

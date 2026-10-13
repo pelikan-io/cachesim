@@ -28,6 +28,9 @@ pub struct ExpandSummary {
     pub requests: usize,
     /// Distinct object ids.
     pub objects: usize,
+    /// Ids written at more than one size (with the combined state layout a
+    /// chunk's id is written with and without a state snapshot).
+    pub multi_size_objects: usize,
 }
 
 /// Expand a request trace into an object-level trace.
@@ -38,6 +41,14 @@ pub struct ExpandSummary {
 /// engine reads each prefix chunk and stores it on a miss, so writes in a
 /// replay come from the replayer's fill on miss. `next_access_vtime` is the
 /// row index of the next row with the same `obj_id`, or -1.
+///
+/// `obj_size` is the size of this request's write of the object. With the
+/// combined state layout one id is written with and without a state
+/// snapshot, so its rows can carry two sizes; the count of such ids is
+/// [`ExpandSummary::multi_size_objects`] and `kvtrace.multi_size_objects`.
+/// A write replaces the object, so a store holds the size of the last write
+/// it accepted; a replay that fills only on a miss keeps the size of the
+/// write that missed.
 ///
 /// The input is read twice: once for the object ids, from which a reverse
 /// scan computes `next_access_vtime` in place (8 bytes per row), and once to
@@ -68,23 +79,30 @@ pub fn expand_to_parquet(
     let out = plan_output(input, &std::fs::metadata(input)?, output)?;
     let input_sha256 = kvtrace::sha256_file(input)?;
     let request_meta = reader.metadata().clone();
-    let created = kvtrace::utc_now_iso8601();
 
     // Pass 1: object ids, overwritten by a reverse scan with the row index of
     // each id's next access. -1 (no next access) is stored as u64::MAX.
+    // Also records each id's first size and whether it was written at another.
     let mut next_access: Vec<u64> = Vec::new();
+    let mut sizes: HashMap<u64, (u64, bool)> = HashMap::new();
     let mut requests = 0usize;
     for req in reader {
         let req = req?;
         requests += 1;
-        next_access.extend(mapper.objects(&req.chunks)?.map(|o| o.obj_id));
+        for o in mapper.objects(&req.chunks)? {
+            let e = sizes.entry(o.obj_id).or_insert((o.size, false));
+            e.1 |= e.0 != o.size;
+            next_access.push(o.obj_id);
+        }
     }
-    let mut seen: HashMap<u64, u64> = HashMap::new();
+    let objects = sizes.len();
+    let multi_size_objects = sizes.values().filter(|&&(_, multi)| multi).count();
+    drop(sizes);
+    let mut seen: HashMap<u64, u64> = HashMap::with_capacity(objects);
     for i in (0..next_access.len()).rev() {
         let id = next_access[i];
         next_access[i] = seen.insert(id, i as u64).unwrap_or(u64::MAX);
     }
-    let objects = seen.len();
     drop(seen);
     let rows = next_access.len();
 
@@ -92,10 +110,10 @@ pub fn expand_to_parquet(
         &request_meta,
         input,
         &input_sha256,
-        created,
         geometry,
         &mapper,
         requests,
+        multi_size_objects,
     );
 
     // Pass 2: regenerate the rows and stream them out.
@@ -140,6 +158,7 @@ pub fn expand_to_parquet(
         rows,
         requests,
         objects,
+        multi_size_objects,
     })
 }
 
@@ -148,10 +167,10 @@ fn object_metadata(
     request_meta: &BTreeMap<String, String>,
     input: &Path,
     input_sha256: &str,
-    created: String,
     geometry: &Geometry,
     mapper: &ObjectMapper,
     requests: usize,
+    multi_size_objects: usize,
 ) -> BTreeMap<String, String> {
     // The request trace's provenance, minus the keys that describe that file.
     let mut m: BTreeMap<String, String> = request_meta
@@ -175,7 +194,7 @@ fn object_metadata(
     };
     set("kvtrace.format", "objects".into());
     set("kvtrace.version", OBJECT_METADATA_VERSION.into());
-    set("kvtrace.created", created);
+    set("kvtrace.created", kvtrace::utc_now_iso8601());
     set(
         "kvtrace.request_trace.file",
         input
@@ -192,6 +211,7 @@ fn object_metadata(
             .unwrap_or_default(),
     );
     set("kvtrace.requests", requests.to_string());
+    set("kvtrace.multi_size_objects", multi_size_objects.to_string());
     set(
         "kvtrace.model",
         geometry.model_name.clone().unwrap_or_default(),
@@ -336,7 +356,8 @@ mod tests {
             ExpandSummary {
                 rows: 10,
                 requests: 4,
-                objects: 8
+                objects: 8,
+                multi_size_objects: 0,
             }
         );
 
@@ -420,7 +441,7 @@ mod tests {
         both(0, 0, Kv, 1280);
         both(0, 1, KvWithState, 1780);
         both(0, 0, Kv, 1280);
-        both(0, 1, Kv, 1280); // a different object from the kind-2 one above
+        both(0, 1, Kv, 1280); // the same ids as request 0's state-carrying write
         both(1, 0, Kv, 1280);
         both(1, 1, KvWithState, 1780);
         both(3, 0, Kv, 1280);
@@ -431,9 +452,12 @@ mod tests {
         assert_eq!(got, expect);
         let next: Vec<i64> = rows.iter().map(|r| r.next_access_vtime).collect();
         let mut want = vec![-1i64; 20];
-        want[..2].copy_from_slice(&[4, 5]);
+        want[..4].copy_from_slice(&[4, 5, 6, 7]);
         assert_eq!(next, want);
-        assert_eq!(summary.objects, 18);
+        // 8 chunks x 2 ranks; chunk (0, 1) is written with and without state.
+        assert_eq!(summary.objects, 16);
+        assert_eq!(summary.multi_size_objects, 2);
+        assert_eq!(meta["kvtrace.multi_size_objects"], "2");
         assert_eq!(meta["kvtrace.state_mode"], "per-request");
         assert_eq!(meta["kvtrace.state_layout"], "combined");
         assert_eq!(meta["kvtrace.state_tp_divisor"], "2");

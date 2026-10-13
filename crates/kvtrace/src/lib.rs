@@ -1,5 +1,5 @@
 //! KV-cache traces for LLM serving: a request-level trace format, model
-//! geometry, and the mapping from a request to the KV-cache objects it reads.
+//! geometry, and the mapping from a request to the KV-cache objects it writes.
 //!
 //! * [`format`](mod@format): one Parquet row per inference request, with the ids of the
 //!   request's full prefix chunks ([`Request`], [`RequestWriter`],
@@ -8,8 +8,9 @@
 //!   of a model, from a Hugging Face `config.json` or given directly
 //!   ([`ModelSizes`]), and their split over tensor-parallel ranks
 //!   ([`Geometry`]).
-//! * [`objects`]: for a request's chunks and a geometry, each object's id,
-//!   size, rank, kind and chunk index, in prefix order ([`ObjectMapper`]).
+//! * [`objects`]: for a request's chunks and a geometry, each object the
+//!   request writes (id, size, rank, kind, chunk index) in prefix order, and
+//!   the ids a lookup probes at a chunk ([`ObjectMapper`]).
 //! * [`mooncake`]: conversion of the public Mooncake trace into the request
 //!   format.
 //! * `hf` (feature `hf-fetch`, on by default): fetch a model's `config.json`
@@ -27,7 +28,10 @@ pub use format::{Request, RequestReader, RequestWriter};
 pub use geometry::{
     dtype_bytes, Geometry, ModelSizes, Sharding, StateLayout, StateMode, DTYPE_NAMES, MAX_TP,
 };
-pub use objects::{obj_id, obj_id_fields, KvObject, ObjectKind, ObjectMapper, Objects};
+pub use objects::{
+    obj_id, obj_id_fields, KvObject, LookupIds, ObjectKind, ObjectMapper, Objects, SLOT_CHUNK,
+    SLOT_STATE,
+};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

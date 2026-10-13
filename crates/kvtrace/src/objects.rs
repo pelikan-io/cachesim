@@ -32,82 +32,101 @@
 //! block boundaries when prefix caching is on ("align" mode,
 //! `vllm/config/cache.py:190-198`), so [`StateMode::PerRequest`] (one
 //! snapshot at the request's last chunk) is the default and
-//! [`StateMode::PerChunk`] is the upper bound. LMCache by default keeps
-//! attention and state pages in one object (`separate_object_groups` off,
-//! `kv_layer_groups.py:332-358`): [`StateLayout::Combined`] adds the state
-//! bytes to that chunk's object, as a distinct object kind because its bytes
-//! differ from the same chunk without state; [`StateLayout::Separate`] makes
-//! the state its own object. vLLM pads the state page to the attention page
-//! size (`platforms/interface.py:1006-1009`); that padding is not modelled.
-//! Convolution state is ignored.
+//! [`StateMode::PerChunk`] is the upper bound. vLLM pads the state page to
+//! the attention page size (`platforms/interface.py:1006-1009`); that padding
+//! is not modelled. Convolution state is ignored.
+//!
+//! # Object ids
+//!
+//! An id is what the store keys the object on:
+//! `chunk << 16 | slot << 12 | rank` ([`obj_id`]).
+//!
+//! * [`StateLayout::Combined`]: with `separate_object_groups` off (the
+//!   default), LMCache keeps a chunk's attention and state pages in a single
+//!   object group, stored as one object keyed by the chunk
+//!   (`kv_layer_groups.py:682-687`). So a chunk has one id per rank, slot 0,
+//!   whether or not a write carries state. A write with a state snapshot
+//!   ([`ObjectKind::KvWithState`]) is larger than one without
+//!   ([`ObjectKind::Kv`]), so the same id can be written at two sizes. A
+//!   write replaces the object: the store holds the size of the last write.
+//! * [`StateLayout::Separate`]: the state is its own object under its own
+//!   key, slot 1 ([`ObjectKind::State`]); the chunk's KV object keeps slot 0.
+//!
+//! [`ObjectKind`] says what a write holds; it is not part of the id except
+//! that a separate state object has its own slot ([`ObjectKind::key_slot`]).
 //!
 //! # Writes, not reuse
 //!
-//! [`ObjectMapper::objects`] lists the objects a request writes (or looks
-//! up before writing): every chunk of its prefix. Which of them a later
-//! request can reuse is the consumer's rule, not this module's. For a model
-//! without recurrent state, any prefix of chunks found in the store is
-//! usable. For a hybrid model, a prefix hit is usable only up to the last
-//! chunk that carries a state snapshot ([`ObjectKind::carries_state`]:
-//! [`ObjectKind::KvWithState`], or a chunk followed by [`ObjectKind::State`]
-//! objects): the linear-attention layers need the state at the point where
-//! computation resumes, so a prefix of KV-only chunks that ends anywhere else
-//! cannot be resumed from. Consumers apply this with [`KvObject::kind`] and
-//! [`KvObject::chunk_index`]. Under [`StateMode::PerRequest`] a request's
-//! snapshot sits on its own last chunk, so a later request with a longer
-//! prompt can reuse that request's chunks only through that last chunk.
+//! [`ObjectMapper::objects`] lists the objects a request writes: every chunk
+//! of its prefix. A replay that stores only on a miss writes just the ones
+//! it missed. Which stored objects a later request can reuse is the
+//! consumer's rule, not this module's. For a model without recurrent state,
+//! any prefix of chunks found in the store is usable. For a hybrid model, a
+//! prefix hit is usable only through the last chunk whose stored object
+//! carries state: the linear-attention layers need the state where
+//! computation resumes, so a prefix that ends at a KV-only chunk cannot be
+//! resumed from. [`ObjectMapper::lookup_ids`] gives the ids to probe at a
+//! chunk:
+//!
+//! * Combined: the one id. Whether the object stored there carries state
+//!   depends on the write that stored it, so the consumer must remember it
+//!   (the [`KvObject::kind`] of that write, [`ObjectKind::carries_state`]).
+//! * Separate: the KV id, and the state id; the chunk is resumable when the
+//!   state id is present.
+//!
+//! Under [`StateMode::PerRequest`] a request's snapshot sits on its own last
+//! chunk, so a later request with a longer prompt can resume through that
+//! chunk but not at an earlier one.
 
 use crate::geometry::{overflow, Geometry, Sharding, StateLayout, StateMode};
 use crate::Error;
 
 /// Bits of an object id that hold the chunk id.
 pub const CHUNK_ID_BITS: u32 = 48;
-pub(crate) const KIND_BITS: u32 = 4;
+pub(crate) const SLOT_BITS: u32 = 4;
 pub(crate) const RANK_BITS: u32 = 12;
 
-/// What an object holds.
+/// Key slot of a chunk's own object: its KV, or KV and state together with
+/// the combined layout.
+pub const SLOT_CHUNK: u64 = 0;
+/// Key slot of a separate state object.
+pub const SLOT_STATE: u64 = 1;
+
+/// What a write holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
     /// Per-token KV of one chunk.
     Kv,
-    /// A recurrent-state snapshot on its own.
+    /// A recurrent-state snapshot on its own (separate layout).
     State,
-    /// A chunk's KV and a state snapshot in one object. A distinct kind
-    /// because its bytes differ from the same chunk's [`Kv`](Self::Kv) object.
+    /// A chunk's KV and a state snapshot in one object (combined layout).
+    /// Same id as the chunk's [`Kv`](Self::Kv) writes; larger.
     KvWithState,
 }
 
 impl ObjectKind {
-    /// Whether an object of this kind holds a recurrent-state snapshot
+    /// Whether a write of this kind holds a recurrent-state snapshot
     /// ([`State`](Self::State) or [`KvWithState`](Self::KvWithState)). For a
-    /// hybrid model, a cached prefix can be resumed only at a chunk with such
-    /// an object; see the [module docs](self#writes-not-reuse).
+    /// hybrid model, a cached prefix can be resumed only at a chunk whose
+    /// stored object carries state; see the
+    /// [module docs](self#writes-not-reuse).
     pub fn carries_state(self) -> bool {
         matches!(self, Self::State | Self::KvWithState)
     }
 
-    /// The kind's 4-bit code in an object id: 0, 1, 2.
-    pub fn code(self) -> u64 {
+    /// The key slot this kind is stored under: [`SLOT_STATE`] for
+    /// [`State`](Self::State), [`SLOT_CHUNK`] otherwise.
+    pub fn key_slot(self) -> u64 {
         match self {
-            Self::Kv => 0,
-            Self::State => 1,
-            Self::KvWithState => 2,
-        }
-    }
-
-    /// Inverse of [`code`](Self::code).
-    pub fn from_code(code: u64) -> Option<Self> {
-        match code {
-            0 => Some(Self::Kv),
-            1 => Some(Self::State),
-            2 => Some(Self::KvWithState),
-            _ => None,
+            Self::Kv | Self::KvWithState => SLOT_CHUNK,
+            Self::State => SLOT_STATE,
         }
     }
 }
 
-/// Pack `(chunk, kind, rank)` into an object id:
-/// `chunk << 16 | kind << 12 | rank`.
+/// Pack `(chunk, kind's key slot, rank)` into an object id:
+/// `chunk << 16 | slot << 12 | rank`. [`ObjectKind::Kv`] and
+/// [`ObjectKind::KvWithState`] give the same id.
 ///
 /// Errors if `chunk` does not fit 48 bits or `rank` 12 bits.
 pub fn obj_id(chunk: u64, kind: ObjectKind, rank: u64) -> Result<u64, Error> {
@@ -116,14 +135,18 @@ pub fn obj_id(chunk: u64, kind: ObjectKind, rank: u64) -> Result<u64, Error> {
             "kvtrace: obj_id field out of range (chunk {chunk}, rank {rank})"
         )));
     }
-    Ok((chunk << KIND_BITS | kind.code()) << RANK_BITS | rank)
+    Ok(pack(chunk, kind.key_slot(), rank))
 }
 
-/// Unpack an object id made by [`obj_id`] into `(chunk, kind code, rank)`.
+fn pack(chunk: u64, slot: u64, rank: u64) -> u64 {
+    (chunk << SLOT_BITS | slot) << RANK_BITS | rank
+}
+
+/// Unpack an object id made by [`obj_id`] into `(chunk, slot, rank)`.
 pub fn obj_id_fields(id: u64) -> (u64, u64, u64) {
     (
-        id >> (KIND_BITS + RANK_BITS),
-        id >> RANK_BITS & ((1 << KIND_BITS) - 1),
+        id >> (SLOT_BITS + RANK_BITS),
+        id >> RANK_BITS & ((1 << SLOT_BITS) - 1),
         id & ((1 << RANK_BITS) - 1),
     )
 }
@@ -131,25 +154,37 @@ pub fn obj_id_fields(id: u64) -> (u64, u64, u64) {
 /// Text for trace metadata describing the [`obj_id`] layout.
 pub fn obj_id_layout() -> String {
     format!(
-        "chunk<<{} | kind<<{RANK_BITS} | rank; \
-         kind 0 = KV, 1 = recurrent state, 2 = KV and state in one object",
-        KIND_BITS + RANK_BITS
+        "chunk<<{} | slot<<{RANK_BITS} | rank; slot 0 = the chunk's object \
+         (KV, or KV and state with the combined layout), 1 = separate state object",
+        SLOT_BITS + RANK_BITS
     )
 }
 
-/// One object a request reads.
+/// One object a request writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvObject {
     /// Object id ([`obj_id`]).
     pub obj_id: u64,
-    /// Bytes this rank stores for the object.
+    /// Bytes this rank stores for the object in this write.
     pub size: u64,
     /// Tensor-parallel rank that stores the object.
     pub rank: u64,
+    /// What this write holds.
     pub kind: ObjectKind,
     /// 0-based position of the object's chunk in the request's prefix. Every
     /// rank's object for a chunk, and its separate state objects, share it.
     pub chunk_index: u32,
+}
+
+/// The ids a lookup probes at one chunk and rank; see
+/// [`ObjectMapper::lookup_ids`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupIds {
+    /// The chunk's object (slot 0): its KV, or KV and state when combined.
+    pub object: u64,
+    /// The separate state object's id (slot 1), with the separate layout
+    /// for a model with recurrent state; `None` otherwise.
+    pub state: Option<u64>,
 }
 
 /// Maps a request's chunks to objects for one geometry and chunk length.
@@ -211,14 +246,37 @@ impl ObjectMapper {
         }
     }
 
-    /// The objects of a request whose full chunks are `chunks`, in prefix
-    /// order. Errors if a chunk id does not fit 48 bits or there are more than
-    /// `u32::MAX` chunks.
+    /// The ids a lookup probes for `chunk` at `rank`. A hybrid model's prefix
+    /// can resume at the chunk only if its stored object carries state: with
+    /// the combined layout the consumer knows that from the write that
+    /// stored [`LookupIds::object`]; with the separate layout
+    /// [`LookupIds::state`] must be present. See the
+    /// [module docs](self#writes-not-reuse).
+    ///
+    /// Errors if `chunk` does not fit 48 bits or `rank` is not a storing
+    /// rank.
+    pub fn lookup_ids(&self, chunk: u64, rank: u64) -> Result<LookupIds, Error> {
+        if rank >= self.sharding.ranks {
+            return Err(Error::InvalidFormat(format!(
+                "kvtrace: rank {rank} is not one of the {} storing ranks",
+                self.sharding.ranks
+            )));
+        }
+        let object = obj_id(chunk, ObjectKind::Kv, rank)?;
+        let state = (self.has_state && self.state_layout == StateLayout::Separate)
+            .then(|| pack(chunk, SLOT_STATE, rank));
+        Ok(LookupIds { object, state })
+    }
+
+    /// The objects a request whose full chunks are `chunks` writes, in prefix
+    /// order. Errors if a chunk id does not fit 48 bits or there are more
+    /// than `u32::MAX` chunks (a chunk index is a `u32`).
     pub fn objects<'a>(&'a self, chunks: &'a [u64]) -> Result<Objects<'a>, Error> {
         if chunks.len() > u32::MAX as usize {
-            return Err(Error::InvalidFormat(
-                "kvtrace: a request has more than 2^32 chunks".into(),
-            ));
+            return Err(Error::InvalidFormat(format!(
+                "kvtrace: a request has {} chunks, more than u32::MAX",
+                chunks.len()
+            )));
         }
         if let Some(&c) = chunks.iter().find(|&&c| c >= 1 << CHUNK_ID_BITS) {
             return Err(Error::InvalidFormat(format!(
@@ -290,7 +348,7 @@ impl Iterator for Objects<'_> {
             return Some(KvObject {
                 // Chunk ids and ranks were range-checked by objects() and
                 // Geometry::sharding().
-                obj_id: (chunk << KIND_BITS | kind.code()) << RANK_BITS | rank,
+                obj_id: pack(chunk, kind.key_slot(), rank),
                 size,
                 rank,
                 kind,
@@ -323,7 +381,10 @@ mod tests {
     fn obj_id_layout_and_fields() {
         assert_eq!(id(0, ObjectKind::Kv, 0), 0);
         assert_eq!(id(1, ObjectKind::Kv, 0), 1 << 16);
-        assert_eq!(id(0, ObjectKind::KvWithState, 0), 2 << 12);
+        // KV with state shares the chunk's id; a separate state object has
+        // slot 1.
+        assert_eq!(id(0, ObjectKind::KvWithState, 0), 0);
+        assert_eq!(id(0, ObjectKind::State, 0), 1 << 12);
         assert_eq!(id(0, ObjectKind::Kv, 7), 7);
         assert_eq!(
             id(5 << 8 | 3, ObjectKind::State, 9),
@@ -336,12 +397,11 @@ mod tests {
             (5, ObjectKind::State, 9),
             ((1 << 48) - 1, ObjectKind::KvWithState, 4095),
         ] {
-            assert_eq!(obj_id_fields(id(c, k, r)), (c, k.code(), r));
+            assert_eq!(obj_id_fields(id(c, k, r)), (c, k.key_slot(), r));
         }
-        for k in [ObjectKind::Kv, ObjectKind::State, ObjectKind::KvWithState] {
-            assert_eq!(ObjectKind::from_code(k.code()), Some(k));
-        }
-        assert_eq!(ObjectKind::from_code(3), None);
+        assert_eq!(ObjectKind::Kv.key_slot(), SLOT_CHUNK);
+        assert_eq!(ObjectKind::KvWithState.key_slot(), SLOT_CHUNK);
+        assert_eq!(ObjectKind::State.key_slot(), SLOT_STATE);
         assert!(!ObjectKind::Kv.carries_state());
         assert!(ObjectKind::State.carries_state());
         assert!(ObjectKind::KvWithState.carries_state());
@@ -527,5 +587,124 @@ mod tests {
         assert_eq!(ObjectMapper::new(&g, 4).unwrap().max_object_size(), 1000);
         let g = Geometry::new(ModelSizes::explicit(10, 0));
         assert_eq!(ObjectMapper::new(&g, 256).unwrap().max_object_size(), 2560);
+    }
+
+    #[test]
+    fn lookup_ids_follow_the_layout() {
+        let mut g = Geometry::new(ModelSizes::explicit(10, 1000));
+        g.tp = 2;
+        let m = ObjectMapper::new(&g, 256).unwrap();
+        assert_eq!(
+            m.lookup_ids(7, 1).unwrap(),
+            LookupIds {
+                object: id(7, ObjectKind::Kv, 1),
+                state: None
+            }
+        );
+        g.state_layout = StateLayout::Separate;
+        let m = ObjectMapper::new(&g, 256).unwrap();
+        assert_eq!(
+            m.lookup_ids(7, 1).unwrap(),
+            LookupIds {
+                object: id(7, ObjectKind::Kv, 1),
+                state: Some(id(7, ObjectKind::State, 1))
+            }
+        );
+        assert!(m.lookup_ids(7, 2).is_err());
+        assert!(m.lookup_ids(1 << 48, 0).is_err());
+        // No recurrent state: no state id even with the separate layout.
+        let mut g = Geometry::new(ModelSizes::explicit(10, 0));
+        g.state_layout = StateLayout::Separate;
+        let m = ObjectMapper::new(&g, 256).unwrap();
+        assert_eq!(m.lookup_ids(7, 0).unwrap().state, None);
+    }
+
+    /// A consumer's store: the last write to each id.
+    type Store = std::collections::HashMap<u64, KvObject>;
+
+    /// Store every object a request writes that is not already present (a
+    /// replay that fills on a miss).
+    fn fill(store: &mut Store, m: &ObjectMapper, chunks: &[u64]) {
+        for o in m.objects(chunks).unwrap() {
+            store.entry(o.obj_id).or_insert(o);
+        }
+    }
+
+    /// The documented reuse rule: the last chunk index through which every
+    /// rank's object is present and, for a hybrid model, the stored object
+    /// carries state.
+    fn resume_through(store: &Store, m: &ObjectMapper, chunks: &[u64]) -> Option<usize> {
+        let mut last = None;
+        for (i, &c) in chunks.iter().enumerate() {
+            let mut present = true;
+            let mut resumable = true;
+            for rank in 0..m.sharding().ranks {
+                let ids = m.lookup_ids(c, rank).unwrap();
+                let Some(obj) = store.get(&ids.object) else {
+                    present = false;
+                    break;
+                };
+                if m.has_state() {
+                    resumable &= match ids.state {
+                        Some(s) => store.contains_key(&s),
+                        None => obj.kind.carries_state(),
+                    };
+                }
+            }
+            if !present {
+                break;
+            }
+            if resumable {
+                last = Some(i);
+            }
+        }
+        last
+    }
+
+    /// A = [1, 2, 3] then B = [1, 2, 3, 4]: B finds all of A's chunks and
+    /// can resume through A's last chunk (index 2) in every mode and layout.
+    /// With B = [1, 2, 4], only per-chunk state lets it resume (at index 1).
+    #[test]
+    fn extending_request_reuses_the_prefix() {
+        for mode in [StateMode::PerRequest, StateMode::PerChunk] {
+            for layout in [StateLayout::Combined, StateLayout::Separate] {
+                let mut g = Geometry::new(ModelSizes::explicit(10, 1000));
+                g.tp = 2;
+                g.state_mode = mode;
+                g.state_layout = layout;
+                let m = ObjectMapper::new(&g, 256).unwrap();
+                let mut store = Store::new();
+                fill(&mut store, &m, &[1, 2, 3]);
+                let case = format!("{mode:?} {layout:?}");
+                assert_eq!(resume_through(&store, &m, &[1, 2, 3, 4]), Some(2), "{case}");
+                let diverging = resume_through(&store, &m, &[1, 2, 4]);
+                match mode {
+                    StateMode::PerRequest => assert_eq!(diverging, None, "{case}"),
+                    StateMode::PerChunk => assert_eq!(diverging, Some(1), "{case}"),
+                }
+                // B's fill on miss adds only chunk 4; A's state-carrying
+                // object at chunk 3 is kept.
+                fill(&mut store, &m, &[1, 2, 3, 4]);
+                assert_eq!(resume_through(&store, &m, &[1, 2, 3]), Some(2), "{case}");
+            }
+        }
+        // Without recurrent state every present chunk is resumable.
+        let g = Geometry::new(ModelSizes::explicit(10, 0));
+        let m = ObjectMapper::new(&g, 256).unwrap();
+        let mut store = Store::new();
+        fill(&mut store, &m, &[1, 2, 3]);
+        assert_eq!(resume_through(&store, &m, &[1, 2, 4]), Some(1));
+    }
+
+    /// With the combined layout, one id is written with and without state.
+    #[test]
+    fn combined_layout_writes_one_id_at_two_sizes() {
+        let g = Geometry::new(ModelSizes::explicit(10, 1000));
+        let m = ObjectMapper::new(&g, 256).unwrap();
+        let a: Vec<KvObject> = m.objects(&[1, 2, 3]).unwrap().collect();
+        let b: Vec<KvObject> = m.objects(&[1, 2, 3, 4]).unwrap().collect();
+        assert_eq!(a[2].obj_id, b[2].obj_id);
+        assert_eq!((a[2].kind, a[2].size), (ObjectKind::KvWithState, 3560));
+        assert_eq!((b[2].kind, b[2].size), (ObjectKind::Kv, 2560));
     }
 }
