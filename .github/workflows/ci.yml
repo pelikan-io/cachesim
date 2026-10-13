@@ -31,10 +31,19 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --workspace --all-targets
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
+
+      - name: Test (no default features)
+        run: cargo test --workspace --no-default-features
+
+      # The reader/writer core alone, as a dependent with
+      # default-features = false gets it. Building in the workspace would
+      # turn the feature back on through cachesim.
+      - name: Test cachetrace core (no importers)
+        run: cargo test -p cachetrace --no-default-features
 
   lint:
     runs-on: ubuntu-latest
@@ -55,10 +64,33 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-lint-
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+      - name: Clippy cachetrace core (no importers)
+        run: cargo clippy -p cachetrace --all-targets --no-default-features -- -D warnings
+
+      - name: cachetrace core has no importer dependencies
+        shell: bash
+        run: |
+          deps=$(cargo tree -p cachetrace --no-default-features -e normal --depth 1 --prefix none)
+          echo "$deps"
+          if echo "$deps" | grep -E '^(ahash|zstd) '; then
+            echo "cachetrace without the import feature depends on an importer crate" >&2
+            exit 1
+          fi
 
       - name: Format
         run: cargo fmt --all --check
+
+      - name: Packages include README and LICENSE
+        shell: bash
+        run: |
+          for p in cachetrace cachesim-rs; do
+            files=$(cargo package --list -p "$p" --allow-dirty)
+            for f in README.md LICENSE; do
+              echo "$files" | grep -qx "$f" || { echo "$p package lacks $f" >&2; exit 1; }
+            done
+          done

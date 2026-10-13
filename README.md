@@ -261,35 +261,119 @@ Output handling, all checked before the first pass:
 
 ## Code Architecture
 
+The repository is a Cargo workspace of two crates:
+
 ```
-src/
-├── lib.rs          # Crate root, module declarations, Error type
-├── trace.rs        # Trace data model, Parquet I/O, format conversion
-├── mooncake.rs     # Mooncake trace → KV-cache object trace
-├── hf.rs           # Hugging Face config.json fetch and cache (hf-fetch feature)
-├── oracle.rs       # Belady and BeladySize oracle caches
-├── simulator.rs    # Cache simulation engine
-└── main.rs         # CLI (clap)
+crates/
+├── cachetrace/          # Object-level trace format (library)
+│   └── src/
+│       ├── lib.rs       # Schema, TraceEntry, Op, TraceReader, TraceWriter, Error
+│       └── import.rs    # libCacheSim binary and cache-trace CSV importers (`import` feature)
+└── cachesim/            # Package `cachesim-rs`: library `cachesim`, binary `cachesim`
+    ├── src/
+    │   ├── lib.rs       # Policy enums, Error, `trace` re-export of cachetrace
+    │   ├── mooncake.rs  # Mooncake trace → KV-cache object trace
+    │   ├── hf.rs        # Hugging Face config.json fetch and cache (hf-fetch feature)
+    │   ├── oracle.rs    # Belady and BeladySize oracle caches
+    │   ├── simulator.rs # Cache simulation engine
+    │   └── main.rs      # CLI (clap)
+    └── tests/           # Integration tests and Mooncake fixtures
 ```
 
-### `trace` module
+`cachesim` depends on `cachetrace` with the `import` feature. Each crate has
+its own `Error`; a `cachetrace::Error` converts into the `cachesim::Error`
+variant of the same name (`Io`, `Parquet`, `Arrow`, `InvalidFormat`), so `?`
+works across the two. `cachetrace::Error` is `#[non_exhaustive]`; a variant
+added later converts to `cachesim::Error::InvalidFormat` with its message
+until it gets an arm of its own.
+
+Publishing: `cachesim-rs` depends on `cachetrace` by version, so `cachetrace`
+has to be published to crates.io first.
+
+### `cachetrace` crate
+
+The trace format on its own, for programs that read or write object-level
+traces without the simulator. `cachesim` re-exports it as `cachesim::trace`,
+so every `cachesim::trace::*` item path from earlier releases still resolves.
+
+The trace functions and `TraceReader`'s iterator now return
+`cachetrace::Error` (`cachesim::trace::Error`), not `cachesim::Error`.
+
+The rule: code that writes or infers `cachesim::Error` as the error type of
+a trace result, without a conversion in between, no longer compiles. That
+covers:
+
+- returning a trace result from a function declared to return
+  `Result<_, cachesim::Error>` without `?` (E0308);
+- a `let` annotated `Result<_, cachesim::Error>` (E0308);
+- `match` or `matches!` on `cachesim::Error` variants of a trace result
+  (E0308);
+- combinators that unify error types, such as
+  `Ok::<_, cachesim::Error>(()).and_then(|_| writer.finish())` (E0308);
+- collecting the reader into `Result<_, cachesim::Error>` (E0277);
+- passing the reader where `Iterator<Item = Result<TraceEntry,
+  cachesim::Error>>` is required, including as a
+  `Box<dyn Iterator<...>>` (E0271);
+- `map_err` with a closure or function whose parameter is typed
+  `cachesim::Error`, e.g. `.map_err(|e: cachesim::Error| ...)` (E0631);
+- `?` in a function whose own error type wraps `cachesim::Error` through
+  `From` (for example a thiserror `#[from] cachesim::Error` variant)
+  (E0277): `?` applies one `From` conversion and there is none from
+  `cachesim::trace::Error` to that type.
+
+Still compiling: `?` into `cachesim::Error`, into `Box<dyn Error>` and into
+anyhow-style error types; `unwrap`, `expect` and `Display` on the error.
+
+One change shows only at run time. A trace error that reaches
+`Box<dyn Error>` or `anyhow::Error` through `?` is now a
+`cachesim::trace::Error`, so `downcast_ref::<cachesim::Error>()` returns
+`None`, `is::<cachesim::Error>()` is false, and walking `source()` (or
+anyhow's `chain()`) never finds a `cachesim::Error`. The `Display` and
+`Debug` text and the `source()` text are unchanged. Remedies: downcast to
+`cachesim::trace::Error`, or apply `.map_err(cachesim::Error::from)` before
+the type is erased.
+
+Separately, `cachesim::trace::Error` is a new item, so a glob import of
+`cachesim::trace::*` together with any other glob that brings an `Error` into
+scope makes a bare `Error` ambiguous (E0659): `cachesim::*`, `std::fmt::*`, or
+`use super::*` in a test module whose parent defines `Error`. Name the type
+by path.
+
+The remedy for the conversions is `.map_err(cachesim::Error::from)` on the
+trace result (or on each item of the reader), or a
+`From<cachesim::trace::Error>` impl on the caller's own error type. Each case
+above was checked with an external crate that compiles against the code
+before the split and fails as listed against this one; the remedies were
+checked to compile.
 
 - **`TraceEntry`** — one cache request (the in-memory row type).
+- **`trace_schema()`** — the Arrow schema of a trace file.
 - **`TraceReader`** — opens a Parquet file and streams `Result<TraceEntry>` values
   one record batch at a time, so traces larger than memory replay at a fixed
   footprint. The footer's row count is available up front via `total_entries()`.
 - **`TraceWriter`** — buffers entries into Arrow `RecordBatch`es and writes
   them to a ZSTD-compressed Parquet file.
-- **`convert_bin_to_parquet()`** — streaming conversion from libCacheSim binary
-  format to Parquet.
-- **`convert_cache_trace_to_parquet()`** — streaming conversion from
-  pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
 - **`TraceWriter::append_key_value_metadata()`** — add a key-value pair to
   the Parquet footer.
 - **`Op`** — operation enum matching `req_op_e`, with `is_read()` /
   `is_write()` / `is_delete()` classification helpers.
 
-### `mooncake` module
+With the `import` feature (on by default):
+
+- **`convert_bin_to_parquet()`** — streaming conversion from libCacheSim binary
+  format to Parquet.
+- **`convert_cache_trace_to_parquet()`** — streaming conversion from
+  pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
+
+`cachetrace = { version = "0.1", default-features = false }` gives the
+schema, row type, reader and writer only: the importer code and cachetrace's
+direct dependencies on `ahash` and `zstd` are left out. `ahash` and `zstd`
+are still built, through `arrow` and `parquet` (Parquet's ZSTD codec needs
+`zstd`), so the feature does not shrink the dependency tree by those two.
+
+### `cachesim` crate
+
+#### `mooncake` module
 
 - **`ModelSizes`** — KV bytes per token and recurrent-state bytes per
   sequence, from a Hugging Face `config.json` (`from_config_file()`,
@@ -298,12 +382,12 @@ src/
   layout, and provenance fields.
 - **`convert_mooncake_to_parquet()`** — two-pass conversion described above.
 
-### `hf` module
+#### `hf` module
 
 - **`fetch_config()`** — return a model's `config.json`, from the cache or
   downloaded. Built with the `hf-fetch` feature.
 
-### `oracle` module
+#### `oracle` module
 
 Offline-optimal eviction policies that use the `next_access_vtime` column
 (future knowledge) to make perfect eviction decisions. These serve as
@@ -320,7 +404,7 @@ theoretical upper bounds when evaluating online policies.
   queue. Supports `lookup` (hit + update oracle data), `insert` (with
   eviction), and `remove`.
 
-### `simulator` module
+#### `simulator` module
 
 - **`SimConfig`** — all knobs for a segcache run: cache size, segment size,
   hash power, eviction policy, default TTL, max object size.
@@ -340,7 +424,7 @@ theoretical upper bounds when evaluating online policies.
 - **`simulate_oracle()`** — same replay loop but against an `OracleCache`.
   Only needs cache size and oracle policy (engine-specific knobs do not apply).
 
-### CLI (`main.rs`)
+#### CLI (`main.rs`)
 
 Three subcommands:
 
@@ -487,7 +571,8 @@ segcache-specific options (segment size, hash power, TTL).
 ## Building
 
 ```bash
-cargo build --release
+cargo build --release            # target/release/cachesim
+cargo test --workspace
 ```
 
 ## License

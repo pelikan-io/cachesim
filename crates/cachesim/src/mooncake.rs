@@ -983,10 +983,11 @@ pub fn convert_mooncake_to_parquet(
             return Err(changed_input());
         }
         if out.temp.is_some() {
-            writer.finish_synced()
+            writer.finish_synced()?;
         } else {
-            writer.finish()
+            writer.finish()?;
         }
+        Ok(())
     };
     let result = pass2().and_then(|()| match &out.temp {
         Some(temp) => std::fs::rename(temp, &out.dest).map_err(Error::from),

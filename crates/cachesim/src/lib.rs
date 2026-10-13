@@ -3,7 +3,10 @@ pub mod hf;
 pub mod mooncake;
 pub mod oracle;
 pub mod simulator;
-pub mod trace;
+
+/// The object-level trace format, now the `cachetrace` crate. Re-exported
+/// here so `cachesim::trace::*` paths from earlier releases keep compiling.
+pub use cachetrace as trace;
 
 // ---------------------------------------------------------------------------
 // Cuckoo-cache eviction policies
@@ -95,4 +98,20 @@ pub enum Error {
 
     #[error("Fetch error: {0}")]
     Fetch(String),
+}
+
+/// Each `cachetrace` error maps to the variant of the same name, carrying the
+/// same source error or message. `cachetrace::Error` is non-exhaustive: a
+/// variant added there later becomes `InvalidFormat` with its message until
+/// it gets an arm here.
+impl From<cachetrace::Error> for Error {
+    fn from(e: cachetrace::Error) -> Self {
+        match e {
+            cachetrace::Error::Io(e) => Self::Io(e),
+            cachetrace::Error::Parquet(e) => Self::Parquet(e),
+            cachetrace::Error::Arrow(e) => Self::Arrow(e),
+            cachetrace::Error::InvalidFormat(m) => Self::InvalidFormat(m),
+            other => Self::InvalidFormat(other.to_string()),
+        }
+    }
 }
