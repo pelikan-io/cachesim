@@ -7,7 +7,8 @@ Cache trace simulator (`cachesim-rs`) for the [cache-rs](https://github.com/peli
 Cargo workspace (virtual root `Cargo.toml`, shared versions in `[workspace.dependencies]`):
 
 - `crates/cachetrace` — object-level trace format: Parquet schema, `TraceEntry`, `Op`, `TraceReader`/`TraceWriter`. Importers (libCacheSim binary, cache-trace CSV) behind the `import` feature, default on; the core must build with `--no-default-features` with no direct dependency on `ahash`/`zstd` (both still build through arrow/parquet). `cachetrace::Error` is `#[non_exhaustive]`.
-- `crates/cachesim` — package `cachesim-rs` (published on crates.io), library `cachesim`, binary `cachesim`. Re-exports `cachetrace` as `cachesim::trace`; keep that path working.
+- `crates/kvtrace` — KV-cache request traces: request-level Parquet format, model geometry (HF config → sizes, TP sharding), request → objects mapping (`ObjectMapper`), Mooncake converter, HF fetch behind `hf-fetch` (default on). Must not depend on `cachetrace`, and must build with `--no-default-features` (no HTTP client): a load generator depends on it for keys and value sizes. `kvtrace::Error` is `#[non_exhaustive]`.
+- `crates/cachesim` — package `cachesim-rs` (published on crates.io), library `cachesim`, binary `cachesim`. Depends on both. Re-exports `cachetrace` as `cachesim::trace` (keep that path working) and `kvtrace` as `cachesim::kvtrace`. `kv::expand_to_parquet` turns a request trace into an object-level trace. Publish `cachetrace` and `kvtrace` before `cachesim-rs`.
 - Rust edition 2021, Apache-2.0
 
 ## Build & Test
@@ -18,9 +19,11 @@ cargo build --release                # optimized (lto, codegen-units=1)
 cargo test --workspace               # all tests
 cargo test --workspace --no-default-features
 cargo test -p cachetrace --no-default-features   # trace core without importers
+cargo test -p kvtrace --no-default-features      # kvtrace without the HTTP client
 cargo clippy --workspace --all-targets -- -D warnings   # lint (CI enforces zero warnings)
 cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 cargo clippy -p cachetrace --all-targets --no-default-features -- -D warnings
+cargo clippy -p kvtrace --all-targets --no-default-features -- -D warnings
 cargo test --workspace -- --ignored  # network test: fetches a config from huggingface.co
 cargo fmt --all --check              # format check (CI enforces)
 ```
@@ -34,13 +37,19 @@ CI runs on ubuntu, macos, and windows. All four checks (lint, 3x build-and-test)
 ```
 crates/cachetrace/src/lib.rs     TraceEntry, Op, trace_schema(), TraceReader/Writer, Error
 crates/cachetrace/src/import.rs  libCacheSim binary + cache-trace CSV importers (feature `import`)
-crates/cachesim/src/lib.rs       Policy enums (SegcachePolicy, CuckooPolicy), Error, `pub use cachetrace as trace`
-crates/cachesim/src/mooncake.rs  Mooncake trace → KV-cache object trace (ModelSizes, convert_mooncake_to_parquet)
-crates/cachesim/src/hf.rs        Hugging Face config.json fetch + cache (feature `hf-fetch`, default on)
+crates/kvtrace/src/format.rs     Request trace schema, Request, RequestReader/Writer, kvtrace.* metadata keys
+crates/kvtrace/src/geometry.rs   ModelSizes (config.json → sizes), Geometry, Sharding (TP checks)
+crates/kvtrace/src/objects.rs    ObjectMapper: request chunks → KvObject (obj_id, size, rank, kind, chunk_index)
+crates/kvtrace/src/mooncake.rs   Mooncake JSON lines → request trace (full chunks only, chunk_id)
+crates/kvtrace/src/output.rs     plan_output: output refusals, temp file + rename
+crates/kvtrace/src/hf.rs         Hugging Face config.json fetch + cache (feature `hf-fetch`, default on)
+crates/kvtrace/tests/fixtures/   Mooncake trace, model configs
+crates/cachesim/src/lib.rs       Policy enums (SegcachePolicy, CuckooPolicy), Error, `pub use cachetrace as trace`, `pub use kvtrace`
+crates/cachesim/src/kv.rs        expand_to_parquet: request trace + Geometry → object-level trace (KV simulation mode goes here)
 crates/cachesim/src/oracle.rs    OracleCache with Belady/BeladySize policies
 crates/cachesim/src/simulator.rs SimConfig/CuckooConfig, simulate_segcache()/simulate_cuckoo()/simulate_oracle(), SimResult
-crates/cachesim/src/main.rs      CLI (clap): simulate, convert, info subcommands
-crates/cachesim/tests/           api_paths.rs (old `cachesim::trace` paths), Mooncake fixtures
+crates/cachesim/src/main.rs      CLI (clap): simulate, convert, info, kv expand
+crates/cachesim/tests/           api_paths.rs (old `cachesim::trace` paths)
 ```
 
 ## Architecture
@@ -73,7 +82,9 @@ Each engine has its own config struct, simulation function, and policy enum:
 
 ### Trace format
 
-Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `obj_size` (u32), `next_access_vtime` (i64). Optional: `op` (u8), `ttl` (i32). Import from libCacheSim binary, pelikan-io/cache-trace CSV, or Mooncake JSON lines via `convert` subcommand.
+Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `obj_size` (u32), `next_access_vtime` (i64). Optional: `op` (u8), `ttl` (i32). Import from libCacheSim binary or pelikan-io/cache-trace CSV via `convert`.
+
+KV-cache request traces (kvtrace): one row per request with `chunks` list<u64> of full-chunk ids; `chunk_tokens` is file metadata; no object sizes. `convert -f mooncake` writes one; `kv expand` maps it to object rows with a model geometry.
 
 ## Conventions
 
@@ -81,6 +92,6 @@ Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `
 - `cargo clippy --workspace --all-targets -- -D warnings` must be clean (and the `--no-default-features` forms above)
 - Keep README.md in sync with code changes (CLI options, engines, architecture)
 - Policy enums in `lib.rs` mirror upstream crate policies with `From` conversions
-- Errors use `thiserror` with `#[from]` for automatic conversion; one `Error` per crate. A new `cachetrace::Error` variant needs a matching arm in `cachesim`'s `From<cachetrace::Error>`
+- Errors use `thiserror` with `#[from]` for automatic conversion; one `Error` per crate. A new `cachetrace::Error` or `kvtrace::Error` variant needs a matching arm in the `From` impls in `crates/cachesim/src/lib.rs`
 - Tests use synthetic Parquet traces via `write_synthetic_trace()` helper in `simulator::tests`
 - Do not include `claude.ai` session links in commits or PRs

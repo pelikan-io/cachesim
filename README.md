@@ -19,7 +19,8 @@ Traces are stored on disk as [Parquet](https://parquet.apache.org/) files, and
 cachesim can import libCacheSim's binary trace formats,
 [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV files,
 and the public [Mooncake](https://github.com/kvcache-ai/Mooncake) LLM serving
-traces (expanded into KV-cache object traces) directly.
+traces (as KV-cache request traces, which `cachesim kv expand` turns into
+object traces for a given model).
 
 ## Data Format
 
@@ -124,24 +125,79 @@ Field mapping during import:
 | `ttl`         | `ttl`                | 0 -> null, >0 -> Some                       |
 | —             | `next_access_vtime`  | set to `-1` (not available in CSV)          |
 
-### Mooncake KV-cache traces
+### Mooncake traces and KV-cache request traces
 
-`-f mooncake` converts a Mooncake trace (FAST '25, JSON lines) into a trace
-of KV-cache objects, as an LLM serving engine with an external KV store
-(LMCache-style) would read them. Each input line is one request:
+KV-cache traces have two levels:
+
+1. A request trace (crate `kvtrace`): one row per inference request, listing
+   the ids of the request's full prefix chunks. It does not depend on a
+   model.
+2. An object-level trace in the format above: one row per KV-cache object a
+   request reads, sized for one model geometry (sizes, tensor parallelism,
+   recurrent-state placement), as an LLM serving engine with an external KV
+   store (LMCache-style) would read them.
+
+`cachesim convert -f mooncake` makes the first from a Mooncake trace;
+`cachesim kv expand` makes the second from the first.
+
+CLI change: `convert -f mooncake` used to write the object-level trace
+directly and took the model options (`--model`, `--model-config`,
+`--kv-bytes-per-token`, `--tp`, `--state-mode`, ...). It now writes a request
+trace and takes only `--chunk-tokens`; the model options moved to
+`cachesim kv expand`. `expand(convert(x))` gives the same rows as the old
+direct conversion except that partial chunks are dropped (see below).
+`simulate` and `info` refuse a request trace.
+
+#### Converting a Mooncake trace
+
+A Mooncake trace (FAST '25) is JSON lines, one request per line:
 
 ```json
 {"timestamp": 27482, "input_length": 6955, "output_length": 52, "hash_ids": [46, 47, 48]}
 ```
 
 `timestamp` is in milliseconds. Each `hash_ids` entry names one 512-token
-prompt block; equal ids mean equal prefix content. The last block holds
-`input_length - 512 * (n - 1)` tokens, clamped to 1..512.
+prompt block; equal ids mean equal prefix content. Each block is split into
+`512 / --chunk-tokens` chunks (default 256 tokens, as in LMCache v0.5.5), and
+chunk `c` of block `h` has id `h << 8 | c`. Only full chunks are kept, as
+LMCache does by default (`save_unfull_chunk = False`). Every block but the
+last holds 512 tokens; the last holds `input_length - 512 * (n - 1)`, clamped
+to 1..512, because `input_length` and `hash_ids` can disagree:
+
+- `input_length > 512 * n`: the last block is taken as full. Counted as
+  `kvtrace.converter.input_beyond_blocks`.
+- `input_length < 512 * (n - 1) + 1`: the last block is taken as 1 token and
+  has no full chunk. Counted as `kvtrace.converter.input_short_of_blocks`.
+
+Both counts are also printed on stderr. `input_tokens` keeps `input_length`
+as given.
+
+The input must be an uncompressed regular file: directories, pipes and
+`.zst`/`.zstd`/`.gz` files (any letter case) are rejected; decompress first.
+
+#### Request trace format
+
+| Column          | Arrow Type             | Nullable | Description                                         |
+|-----------------|------------------------|----------|-----------------------------------------------------|
+| `timestamp`     | `Timestamp(ns, UTC)`   | no       | Request arrival in nanoseconds since Unix epoch     |
+| `req_id`        | `UInt64`               | no       | Request id (Mooncake: index among non-empty lines)  |
+| `input_tokens`  | `UInt32`               | no       | Prompt length as the source gives it                |
+| `output_tokens` | `UInt32`               | no       | Generated tokens                                    |
+| `chunks`        | `List<UInt64>`         | no       | Full prefix chunk ids, in prefix order              |
+| `session_id`    | `UInt64`               | yes      | Session id, for sources that need reconstruction    |
+
+Footer key-value metadata: `kvtrace.format` = `requests`, `kvtrace.version` =
+`1`, `kvtrace.chunk_tokens` (every chunk's length), `kvtrace.created`,
+`kvtrace.source.*` (source format, file name, SHA-256, block length),
+`kvtrace.converter.*` (chunk id rule, the counts above), `kvtrace.requests`
+and `kvtrace.chunks`.
+
+#### Expanding to KV-cache objects (`cachesim kv expand`)
 
 Objects (defaults follow LMCache v0.5.5):
 
-- One object is one chunk of `--chunk-tokens` tokens (default 256) of a
-  block, across all layers. Its size is tokens × KV bytes per token.
+- One object is one chunk across all layers. Its size is chunk tokens × KV
+  bytes per token.
 - `--tp N`: each tensor-parallel rank stores its own shard, so each chunk is
   N objects. A rank's KV share follows vLLM v0.31 (db9527a), which splits
   KV heads across ranks and replicates them once N reaches the head count
@@ -168,22 +224,24 @@ Objects (defaults follow LMCache v0.5.5):
   object, which becomes a distinct object kind; `separate` stores the state
   as its own object.
 
-Columns:
+Columns of the expanded trace:
 
 | Column              | Value                                                  |
 |---------------------|--------------------------------------------------------|
-| `timestamp`         | request timestamp, ms → ns                             |
-| `obj_id`            | `block << 24 \| chunk << 16 \| kind << 12 \| rank`     |
-| `obj_size`          | first size seen for the `obj_id` (see below)           |
+| `timestamp`         | the request's timestamp                                |
+| `obj_id`            | `chunk << 16 \| kind << 12 \| rank`                     |
+| `obj_size`          | bytes the rank stores for the object                   |
 | `next_access_vtime` | row index of the next access to the `obj_id`, or `-1`  |
 | `op`                | `1` (GET) on every row                                 |
 | `ttl`               | null                                                   |
 
-`kind` is 0 for KV, 1 for a separate state object, and 2 for KV and state in
-one object. Every row is a GET: on a miss the engine computes the chunk and
-stores it, so writes in a replay come from fill on miss. If an id recurs with
-a different computed size (a partial last block that later appears full), the
-first size is kept and the row is counted in `kvtrace.size_conflicts`.
+For a Mooncake trace, `chunk` is `block << 8 | sub-chunk`, so `obj_id` is
+`block << 24 | sub-chunk << 16 | kind << 12 | rank` as before. `kind` is 0 for
+KV, 1 for a separate state object, and 2 for KV and state in one object.
+Every row is a GET: on a miss the engine computes the chunk and stores it, so
+writes in a replay come from fill on miss. Rows follow the requests in order
+and each request's prefix in order: per chunk, its rank objects, then its
+separate state objects.
 
 Model sizes come from one of:
 
@@ -196,7 +254,7 @@ Model sizes come from one of:
   `$HF_HOME/cachesim/configs`, else `$XDG_CACHE_HOME/cachesim/hf-configs`,
   else `~/.cache/cachesim/hf-configs` (`%LOCALAPPDATA%\cachesim\hf-configs`
   on Windows). A cached file is used without contacting the network, so later
-  conversions work offline; delete it, or pass a commit hash as the
+  expansions work offline; delete it, or pass a commit hash as the
   revision, to fetch another version. Requires the `hf-fetch` cargo feature
   (on by default; build with `--no-default-features` to drop the HTTP
   client).
@@ -207,8 +265,8 @@ From a config (fields read from `text_config` when present):
 
 - Full-attention layers: the `full_attention` entries of `layer_types`, else
   `num_hidden_layers / full_attention_interval`, else `num_hidden_layers`.
-  The remaining layers are linear-attention layers. Configs the converter
-  cannot size are rejected: a `layer_types` entry other than
+  The remaining layers are linear-attention layers. Configs that cannot
+  be sized are rejected: a `layer_types` entry other than
   `full_attention` or `linear_attention` (e.g. `sliding_attention`), a
   `sliding_window` without `layer_types` (unless `use_sliding_window` is
   false), and Mamba-style hybrids (`hybrid_override_pattern`,
@@ -230,21 +288,22 @@ From a config (fields read from `text_config` when present):
 
 For example, Qwen/Qwen3-8B is 36 × 8 × 128 × 2 × 2 = 147,456 bytes per token.
 
-Provenance is written to the Parquet footer as key-value metadata under
-`kvtrace.*` keys: source file name and SHA-256, model id, revision and config
-SHA-256, derived sizes and layer counts, chunk size, TP degree, state mode and
-layout, request count, size-conflict count, and the `obj_id` layout.
+Provenance is written to the footer as `kvtrace.*` metadata: the request
+trace's source, converter and chunk keys, the request trace's file name and
+SHA-256, the model id, revision and config SHA-256, derived sizes and layer
+counts, TP degree and divisors, state mode and layout, request count, and the
+`obj_id` layout. `kvtrace.format` is `objects` and `kvtrace.version` is `2`
+(version 1 was the direct conversion, which kept partial chunks).
 
-The converter reads the input twice, so the input must be an uncompressed
-regular file: directories, pipes (including a piped `/dev/stdin`) and
-`.zst`/`.zstd`/`.gz` files (any letter case) are rejected; decompress first. The first pass builds the `obj_id` column (8 bytes per
-row), which a reverse scan overwrites in place with `next_access_vtime`; the
-scan's map of distinct objects is then freed. That column and a map from
-each distinct object to its size stay in memory through the second pass,
-which regenerates the rows and streams them to the writer. The input's
-SHA-256 must match across the two passes.
+`kv expand` reads the request trace twice. The first pass builds the `obj_id`
+column (8 bytes per row), which a reverse scan overwrites in place with
+`next_access_vtime`; the scan's map of distinct objects is then freed. The
+second pass regenerates the rows and streams them to the writer. The request
+trace's SHA-256 must match before and after. An object larger than
+`u32::MAX` bytes is an error.
 
-Output handling, all checked before the first pass:
+Output handling (both `convert -f mooncake` and `kv expand`), checked before
+any work is done:
 
 - An output that is the input file (same path, a symlink to it, or a hard
   link), a directory, or an existing read-only file is refused.
@@ -261,7 +320,7 @@ Output handling, all checked before the first pass:
 
 ## Code Architecture
 
-The repository is a Cargo workspace of two crates:
+The repository is a Cargo workspace of three crates:
 
 ```
 crates/
@@ -269,26 +328,41 @@ crates/
 │   └── src/
 │       ├── lib.rs       # Schema, TraceEntry, Op, TraceReader, TraceWriter, Error
 │       └── import.rs    # libCacheSim binary and cache-trace CSV importers (`import` feature)
+├── kvtrace/             # KV-cache request traces and model geometry (library)
+│   ├── src/
+│   │   ├── lib.rs       # Error, re-exports, SHA-256 and timestamp helpers
+│   │   ├── format.rs    # Request trace schema, Request, RequestReader, RequestWriter
+│   │   ├── geometry.rs  # ModelSizes (config.json → sizes), Geometry, Sharding
+│   │   ├── objects.rs   # Request → objects: ObjectMapper, KvObject, obj_id
+│   │   ├── mooncake.rs  # Mooncake trace → request trace
+│   │   ├── output.rs    # Output file refusal and temporary-file rename
+│   │   └── hf.rs        # Hugging Face config.json fetch and cache (hf-fetch feature)
+│   └── tests/fixtures/  # Mooncake trace and model configs
 └── cachesim/            # Package `cachesim-rs`: library `cachesim`, binary `cachesim`
     ├── src/
-    │   ├── lib.rs       # Policy enums, Error, `trace` re-export of cachetrace
-    │   ├── mooncake.rs  # Mooncake trace → KV-cache object trace
-    │   ├── hf.rs        # Hugging Face config.json fetch and cache (hf-fetch feature)
+    │   ├── lib.rs       # Policy enums, Error, re-exports of cachetrace and kvtrace
+    │   ├── kv.rs        # Request trace → object-level trace (expand)
     │   ├── oracle.rs    # Belady and BeladySize oracle caches
     │   ├── simulator.rs # Cache simulation engine
     │   └── main.rs      # CLI (clap)
-    └── tests/           # Integration tests and Mooncake fixtures
+    └── tests/           # Integration tests
 ```
 
-`cachesim` depends on `cachetrace` with the `import` feature. Each crate has
-its own `Error`; a `cachetrace::Error` converts into the `cachesim::Error`
-variant of the same name (`Io`, `Parquet`, `Arrow`, `InvalidFormat`), so `?`
-works across the two. `cachetrace::Error` is `#[non_exhaustive]`; a variant
-added later converts to `cachesim::Error::InvalidFormat` with its message
-until it gets an arm of its own.
+`cachetrace` and `kvtrace` do not depend on each other; `cachesim` depends on
+both. A load generator can depend on `kvtrace` alone (with
+`default-features = false` it has no HTTP client) to get the same object ids
+and sizes the simulator uses, or on `cachetrace` alone to play back an
+object-level trace.
 
-Publishing: `cachesim-rs` depends on `cachetrace` by version, so `cachetrace`
-has to be published to crates.io first.
+Each crate has its own `Error`. A `cachetrace::Error` or `kvtrace::Error`
+converts into the `cachesim::Error` variant of the same name (`Io`,
+`Parquet`, `Arrow`, `InvalidFormat`, and `Fetch` from kvtrace), so `?` works
+across them. Both are `#[non_exhaustive]`; a variant added later converts to
+`cachesim::Error::InvalidFormat` with its message until it gets an arm of its
+own.
+
+Publishing: `cachesim-rs` depends on `cachetrace` and `kvtrace` by version,
+so both have to be published to crates.io before it.
 
 ### `cachetrace` crate
 
@@ -371,21 +445,37 @@ direct dependencies on `ahash` and `zstd` are left out. `ahash` and `zstd`
 are still built, through `arrow` and `parquet` (Parquet's ZSTD codec needs
 `zstd`), so the feature does not shrink the dependency tree by those two.
 
+### `kvtrace` crate
+
+- **`Request`**, **`RequestWriter`**, **`RequestReader`**, **`request_schema()`**
+  (`format`) — the request trace format described above. The reader checks
+  `kvtrace.format`, `kvtrace.version` and `kvtrace.chunk_tokens` and exposes
+  the footer metadata.
+- **`ModelSizes`** (`geometry`) — KV bytes per token and recurrent-state bytes
+  per sequence, from a Hugging Face `config.json` (`from_config_file()`,
+  `from_config_bytes()`, `from_config()`) or given directly (`explicit()`).
+- **`Geometry`** — sizes, TP degree, state mode and layout, and provenance
+  fields; `sharding()` checks the TP degree against the model and returns
+  the per-rank **`Sharding`**.
+- **`ObjectMapper`** (`objects`) — built from a `Geometry` and a chunk
+  length; `objects(&chunks)` yields each **`KvObject`** of a request (`obj_id`,
+  `size`, `rank`, `kind`, `chunk_index`) in prefix order. **`obj_id()`**,
+  **`obj_id_fields()`** and **`ObjectKind`** describe the id layout.
+- **`mooncake::convert_mooncake()`** — Mooncake JSON lines to a request
+  trace; **`mooncake::chunk_id()`** is the chunk id rule.
+- **`output::plan_output()`** — the output handling described above.
+- **`hf::fetch_config()`** — return a model's `config.json`, from the cache or
+  downloaded. Built with the `hf-fetch` feature (default on).
+
 ### `cachesim` crate
 
-#### `mooncake` module
+`cachesim::trace` is `cachetrace` and `cachesim::kvtrace` is `kvtrace`.
 
-- **`ModelSizes`** — KV bytes per token and recurrent-state bytes per
-  sequence, from a Hugging Face `config.json` (`from_config_file()`,
-  `from_config_bytes()`) or given directly (`explicit()`).
-- **`MooncakeOptions`** — sizes, chunk size, TP degree, state mode and
-  layout, and provenance fields.
-- **`convert_mooncake_to_parquet()`** — two-pass conversion described above.
+#### `kv` module
 
-#### `hf` module
-
-- **`fetch_config()`** — return a model's `config.json`, from the cache or
-  downloaded. Built with the `hf-fetch` feature.
+- **`expand_to_parquet()`** — request trace + `Geometry` → object-level
+  trace, as described above. A KV simulation mode that replays request
+  traces directly belongs here.
 
 #### `oracle` module
 
@@ -426,13 +516,12 @@ theoretical upper bounds when evaluating online policies.
 
 #### CLI (`main.rs`)
 
-Three subcommands:
-
 | Command     | Description                                                  |
 |-------------|--------------------------------------------------------------|
 | `simulate`  | Replay a Parquet trace against segcache, cuckoo, or oracle   |
 | `convert`   | Import a trace to Parquet (binary, CSV, or Mooncake)         |
 | `info`      | Print summary statistics for a Parquet trace file            |
+| `kv expand` | Expand a KV-cache request trace into an object-level trace   |
 
 ## Usage
 
@@ -443,14 +532,16 @@ cachesim convert -i trace.oracleGeneral.bin -o trace.parquet
 # Convert a pelikan-io/cache-trace CSV (zstd-compressed)
 cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
 
-# Convert a Mooncake trace to KV-cache objects, model config from Hugging Face
-cachesim convert -i conversation_trace.jsonl -o conv.parquet -f mooncake \
-    --model Qwen/Qwen3-8B
+# Convert a Mooncake trace to a KV-cache request trace (256-token chunks)
+cachesim convert -i conversation_trace.jsonl -o conv-requests.parquet -f mooncake
+
+# Expand it into KV-cache objects, model config from Hugging Face
+cachesim kv expand -i conv-requests.parquet -o conv.parquet --model Qwen/Qwen3-8B
 
 # Hybrid model, tensor parallel 8, offline with a local config.json.
 # Qwen3.8-27B has 4 KV heads, so each of the 8 ranks holds 1/4 of the KV
 # (16,384 B/token) and 1/8 of the recurrent state (18,874,368 B).
-cachesim convert -i conversation_trace.jsonl -o conv-tp8.parquet -f mooncake \
+cachesim kv expand -i conv-requests.parquet -o conv-tp8.parquet \
     --model-config config.json --model-name Qwen/Qwen3.8-27B --tp 8 \
     --state-mode per-request --state-layout combined
 
@@ -485,8 +576,21 @@ cachesim info -t trace.parquet
                            [default: oracle-general]
 ```
 
-Mooncake options (`-f mooncake`; one of `--model`, `--model-config`,
-`--kv-bytes-per-token` is required):
+Mooncake option (`-f mooncake`):
+
+```
+    --chunk-tokens <N>           Tokens per chunk; divides 512 [default: 256]
+```
+
+### `kv expand` options
+
+```
+-i, --input <PATH>               Request trace (required)
+-o, --output <PATH>              Output object-level trace (required)
+```
+
+Model geometry (one of `--model`, `--model-config`, `--kv-bytes-per-token`
+is required):
 
 ```
     --model <REPO_ID>            Fetch config.json from Hugging Face (cached)
@@ -497,7 +601,6 @@ Mooncake options (`-f mooncake`; one of `--model`, `--model-config`,
     --kv-dtype <DTYPE>           Override the config's KV dtype
                                  (bfloat16, float16, float32, fp8, float8_e4m3fn)
     --model-name <NAME>          Model id for the metadata (with --model-config or explicit sizes)
-    --chunk-tokens <N>           Tokens per object; divides 512 [default: 256]
     --tp <N>                     Tensor-parallel degree [default: 1]
     --state-mode <MODE>          per-request | per-chunk [default: per-request]
     --state-layout <LAYOUT>      combined | separate [default: combined]
