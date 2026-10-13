@@ -17,9 +17,10 @@
 //! ([`TraceEntry`], [`Op`]), [`TraceReader`] and [`TraceWriter`]. The `import`
 //! cargo feature (on by default) adds conversion from libCacheSim binary
 //! traces and [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace)
-//! CSV files (optionally zstd-compressed); build with
-//! `default-features = false` to leave the importers and their dependencies
-//! out.
+//! CSV files (optionally zstd-compressed). Build with
+//! `default-features = false` to leave the importers out; that removes this
+//! crate's direct dependencies on `ahash` and `zstd`, but both are still
+//! built through `arrow` and `parquet`.
 
 use std::fs::File;
 use std::path::Path;
@@ -552,6 +553,8 @@ mod tests {
         assert!(!ts_field.is_nullable());
     }
 
+    /// A file with many row groups must stream through in order, with the
+    /// footer's row count available before the first row is decoded.
     #[test]
     fn reader_streams_across_row_groups() {
         let dir = tempfile::tempdir().unwrap();

@@ -290,8 +290,6 @@ mod tests {
         assert_eq!(entries[2].next_access_vtime, -1);
     }
 
-    /// A file with many row groups must stream through in order, with the
-    /// footer's row count available before the first row is decoded.
     #[test]
     fn parse_cache_trace_csv_line() {
         let state = ahash::RandomState::with_seeds(0, 0, 0, 0);

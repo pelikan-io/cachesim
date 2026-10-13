@@ -295,17 +295,33 @@ has to be published to crates.io first.
 The trace format on its own, for programs that read or write object-level
 traces without the simulator. `cachesim` re-exports it as `cachesim::trace`,
 so every `cachesim::trace::*` item path from earlier releases still resolves.
-Two uses of those paths no longer compile:
 
-- The trace functions and `TraceReader`'s iterator now return
-  `cachetrace::Error`, not `cachesim::Error`. `?` into a function returning
-  `cachesim::Error` still works, but code that names the error type does not:
-  `let rows: Result<Vec<TraceEntry>, cachesim::Error> = reader.collect();`
-  fails (E0277). Collect into `Result<_, cachesim::trace::Error>`, or map
-  with `.map_err(cachesim::Error::from)`.
+The trace functions and `TraceReader`'s iterator now return
+`cachetrace::Error` (`cachesim::trace::Error`), not `cachesim::Error`. The
+one use that is unaffected is `?` on a trace result inside a function whose
+error type is `cachesim::Error` itself, which converts through
+`From<cachesim::trace::Error> for cachesim::Error`. These uses no longer
+compile:
+
+- Returning a trace result as `Result<_, cachesim::Error>` without `?`, e.g.
+  `fn open(p: &Path) -> Result<TraceReader, cachesim::Error> {
+  TraceReader::open(p) }`, fails with E0308.
+- Collecting the reader into `Result<Vec<TraceEntry>, cachesim::Error>`
+  fails with E0277.
+- `?` on a trace result inside a function whose own error type wraps
+  `cachesim::Error` through `From` (for example a thiserror
+  `#[from] cachesim::Error` variant) fails with E0277: `?` applies one
+  `From` conversion, and there is none from `cachesim::trace::Error` to that
+  type.
 - `cachesim::trace::Error` is a new item, so glob-importing both
   `cachesim::*` and `cachesim::trace::*` and then naming `Error` is
   ambiguous (E0659). Name one of them by path.
+
+The remedy for the first three is `.map_err(cachesim::Error::from)` on the
+trace result, or, for a wrapping error type, an added
+`From<cachesim::trace::Error>` impl. Each case was checked with an
+external crate that compiles against the code before the split and fails as
+listed here against this one.
 
 - **`TraceEntry`** — one cache request (the in-memory row type).
 - **`trace_schema()`** — the Arrow schema of a trace file.
@@ -328,9 +344,9 @@ With the `import` feature (on by default):
 
 `cachetrace = { version = "0.1", default-features = false }` gives the
 schema, row type, reader and writer only: the importer code and cachetrace's
-direct dependencies on `ahash` and `zstd` are left out. Both crates are still
-built, through `arrow` and `parquet` (Parquet's ZSTD codec needs `zstd`), so
-the feature does not shrink the dependency tree by those two.
+direct dependencies on `ahash` and `zstd` are left out. `ahash` and `zstd`
+are still built, through `arrow` and `parquet` (Parquet's ZSTD codec needs
+`zstd`), so the feature does not shrink the dependency tree by those two.
 
 ### `cachesim` crate
 
