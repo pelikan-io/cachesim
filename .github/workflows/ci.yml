@@ -84,3 +84,13 @@ jobs:
 
       - name: Format
         run: cargo fmt --all --check
+
+      - name: Packages include README and LICENSE
+        shell: bash
+        run: |
+          for p in cachetrace cachesim-rs; do
+            files=$(cargo package --list -p "$p" --allow-dirty)
+            for f in README.md LICENSE; do
+              echo "$files" | grep -qx "$f" || { echo "$p package lacks $f" >&2; exit 1; }
+            done
+          done

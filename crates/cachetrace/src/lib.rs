@@ -47,7 +47,11 @@ pub use import::{convert_bin_to_parquet, convert_cache_trace_to_parquet, BinForm
 // ---------------------------------------------------------------------------
 
 /// Error type for trace I/O and conversion.
+///
+/// Non-exhaustive so that a variant can be added without breaking callers
+/// that match on it.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

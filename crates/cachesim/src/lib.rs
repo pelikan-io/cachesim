@@ -101,7 +101,9 @@ pub enum Error {
 }
 
 /// Each `cachetrace` error maps to the variant of the same name, carrying the
-/// same source error or message.
+/// same source error or message. `cachetrace::Error` is non-exhaustive: a
+/// variant added there later becomes `InvalidFormat` with its message until
+/// it gets an arm here.
 impl From<cachetrace::Error> for Error {
     fn from(e: cachetrace::Error) -> Self {
         match e {
@@ -109,6 +111,7 @@ impl From<cachetrace::Error> for Error {
             cachetrace::Error::Parquet(e) => Self::Parquet(e),
             cachetrace::Error::Arrow(e) => Self::Arrow(e),
             cachetrace::Error::InvalidFormat(m) => Self::InvalidFormat(m),
+            other => Self::InvalidFormat(other.to_string()),
         }
     }
 }

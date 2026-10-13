@@ -283,13 +283,29 @@ crates/
 `cachesim` depends on `cachetrace` with the `import` feature. Each crate has
 its own `Error`; a `cachetrace::Error` converts into the `cachesim::Error`
 variant of the same name (`Io`, `Parquet`, `Arrow`, `InvalidFormat`), so `?`
-works across the two.
+works across the two. `cachetrace::Error` is `#[non_exhaustive]`; a variant
+added later converts to `cachesim::Error::InvalidFormat` with its message
+until it gets an arm of its own.
+
+Publishing: `cachesim-rs` depends on `cachetrace` by version, so `cachetrace`
+has to be published to crates.io first.
 
 ### `cachetrace` crate
 
 The trace format on its own, for programs that read or write object-level
 traces without the simulator. `cachesim` re-exports it as `cachesim::trace`,
-so code written against `cachesim::trace::*` keeps compiling.
+so every `cachesim::trace::*` item path from earlier releases still resolves.
+Two uses of those paths no longer compile:
+
+- The trace functions and `TraceReader`'s iterator now return
+  `cachetrace::Error`, not `cachesim::Error`. `?` into a function returning
+  `cachesim::Error` still works, but code that names the error type does not:
+  `let rows: Result<Vec<TraceEntry>, cachesim::Error> = reader.collect();`
+  fails (E0277). Collect into `Result<_, cachesim::trace::Error>`, or map
+  with `.map_err(cachesim::Error::from)`.
+- `cachesim::trace::Error` is a new item, so glob-importing both
+  `cachesim::*` and `cachesim::trace::*` and then naming `Error` is
+  ambiguous (E0659). Name one of them by path.
 
 - **`TraceEntry`** — one cache request (the in-memory row type).
 - **`trace_schema()`** — the Arrow schema of a trace file.
@@ -311,8 +327,10 @@ With the `import` feature (on by default):
   pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
 
 `cachetrace = { version = "0.1", default-features = false }` gives the
-schema, row type, reader and writer only, without the importers' `ahash` and
-`zstd` dependencies.
+schema, row type, reader and writer only: the importer code and cachetrace's
+direct dependencies on `ahash` and `zstd` are left out. Both crates are still
+built, through `arrow` and `parquet` (Parquet's ZSTD codec needs `zstd`), so
+the feature does not shrink the dependency tree by those two.
 
 ### `cachesim` crate
 

@@ -6,7 +6,7 @@ Cache trace simulator (`cachesim-rs`) for the [cache-rs](https://github.com/peli
 
 Cargo workspace (virtual root `Cargo.toml`, shared versions in `[workspace.dependencies]`):
 
-- `crates/cachetrace` — object-level trace format: Parquet schema, `TraceEntry`, `Op`, `TraceReader`/`TraceWriter`. Importers (libCacheSim binary, cache-trace CSV) behind the `import` feature, default on; the core must build with `--no-default-features` and without `ahash`/`zstd`.
+- `crates/cachetrace` — object-level trace format: Parquet schema, `TraceEntry`, `Op`, `TraceReader`/`TraceWriter`. Importers (libCacheSim binary, cache-trace CSV) behind the `import` feature, default on; the core must build with `--no-default-features` with no direct dependency on `ahash`/`zstd` (both still build through arrow/parquet). `cachetrace::Error` is `#[non_exhaustive]`.
 - `crates/cachesim` — package `cachesim-rs` (published on crates.io), library `cachesim`, binary `cachesim`. Re-exports `cachetrace` as `cachesim::trace`; keep that path working.
 - Rust edition 2021, Apache-2.0
 
