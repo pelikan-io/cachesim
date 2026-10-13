@@ -45,7 +45,7 @@
 //!   the attention pages plus the recurrent pages for the whole chunk, with
 //!   null pages where no snapshot was taken
 //!   (`multiprocess/modules/lmcache_driven_transfer.py:66-93`
-//!   `get_layout_desc`, `platform/cache_context.py:228`). Here a chunk
+//!   `get_layout_desc`, `platform/cuda/cache_context.py:228`). Here a chunk
 //!   without a snapshot is written at KV size only and a chunk with one at
 //!   KV plus one state, so the same id is written at two sizes and the
 //!   KV-only writes are smaller than LMCache's.
@@ -98,6 +98,18 @@
 //!   without checking whether the store holds the key
 //!   (`storage_backend/remote_backend.py:263-270`, `323-331`). The tests
 //!   here model this as a SET of every chunk after the lookup's prefix hit.
+//!
+//! For hybrid models only insert-if-absent applies in LMCache v0.5.5. vLLM
+//! requires its hybrid KV cache manager (HMA) for hybrid SSM models and
+//! fails at startup when the KV connector does not support it
+//! (`vllm/config/vllm.py:2251-2270`). Only LMCache's multiprocess connector
+//! declares that support (`LMCacheMPConnector(KVConnectorBase_V1,
+//! SupportsHMA)`, `lmcache/integration/vllm/lmcache_mp_connector.py:448`),
+//! and it uses insert-if-absent. The in-process connector that reaches the
+//! SET path does not (vLLM's `LMCacheConnectorV1`,
+//! `kv_connector/v1/lmcache_connector.py:68`; LMCache's adapter reads only
+//! `block_ids[0]`, `vllm_v1_adapter.py:168-179`). The SET examples below
+//! therefore describe a store with that rule, not LMCache.
 //!
 //! Under SET the combined layout can lose a stored snapshot: a later request
 //! that writes the same chunk without a snapshot replaces the

@@ -243,21 +243,46 @@ fn moved_geometry_option(args: impl IntoIterator<Item = String>) -> Option<Strin
 /// block.
 const VLLM_KERNEL_ALIGNMENT: u64 = 16;
 
-/// A warning when a hybrid model's chunk length is not a multiple of the
-/// block size vLLM would use, which LMCache requires.
-fn chunk_size_warning(g: &Geometry, chunk_tokens: u64) -> Option<String> {
-    let block = g.vllm_block_size(VLLM_KERNEL_ALIGNMENT)?;
+/// Check the geometry, then return a warning when a hybrid model's chunk
+/// length is not a multiple of the block size vLLM would use, which LMCache
+/// requires. `source_block_tokens` is the source's block length when the
+/// request trace records one (`kvtrace.source.block_tokens`; Mooncake: 512),
+/// since the converter's chunk length must divide it.
+fn chunk_size_warning(
+    g: &Geometry,
+    chunk_tokens: u64,
+    source_block_tokens: Option<u64>,
+) -> Result<Option<String>, cachesim::Error> {
+    // An invalid tp is an error, reported before any warning.
+    g.sharding()?;
+    let Some(block) = g.vllm_block_size(VLLM_KERNEL_ALIGNMENT) else {
+        return Ok(None);
+    };
     if chunk_tokens.is_multiple_of(block) {
-        return None;
+        return Ok(None);
     }
-    Some(format!(
+    let tp = g.tp;
+    let mut w = format!(
         "warning: chunk_tokens {chunk_tokens} is not a multiple of {block}, the attention \
-         block size vLLM uses for this hybrid model at tp {} with prefix caching \
+         block size vLLM uses for this hybrid model at tp {tp} with prefix caching \
          ({VLLM_KERNEL_ALIGNMENT}-token kernel alignment). LMCache requires the chunk size to \
-         be a multiple of the block size, so the smallest valid chunk is {block} tokens. \
-         Objects are sized for {chunk_tokens}-token chunks anyway.",
-        g.tp
-    ))
+         be a multiple of the block size, so the smallest valid chunk is {block} tokens."
+    );
+    if let Some(src) = source_block_tokens {
+        // The converter's chunk length divides the source block; a divisor
+        // that is a multiple of `block` exists only if `block` divides `src`.
+        if !src.is_multiple_of(block) {
+            w.push_str(&format!(
+                " The source's chunk lengths must divide its {src}-token blocks, and none of \
+                 them is a multiple of {block}, so no chunk length from this source is valid \
+                 for this model at tp {tp}."
+            ));
+        }
+    }
+    w.push_str(&format!(
+        " Objects are sized for {chunk_tokens}-token chunks anyway."
+    ));
+    Ok(Some(w))
 }
 
 /// Reject Mooncake options given with another input format.
@@ -642,8 +667,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             let g = geometry.geometry()?;
             eprintln!("Expanding request trace …");
-            let chunk_tokens = cachesim::kvtrace::RequestReader::open(&input)?.chunk_tokens();
-            if let Some(w) = chunk_size_warning(&g, u64::from(chunk_tokens)) {
+            let reader = cachesim::kvtrace::RequestReader::open(&input)?;
+            let source_block_tokens = reader
+                .metadata()
+                .get("kvtrace.source.block_tokens")
+                .and_then(|v| v.parse::<u64>().ok());
+            let chunk_tokens = u64::from(reader.chunk_tokens());
+            drop(reader);
+            if let Some(w) = chunk_size_warning(&g, chunk_tokens, source_block_tokens)? {
                 eprintln!("{w}");
             }
             eprintln!(
@@ -813,20 +844,50 @@ mod tests {
         let mut g = expand_args(&["--model-config", cfg, "--tp", "8"])
             .geometry()
             .unwrap();
-        let w = chunk_size_warning(&g, 256).unwrap();
+        let w = chunk_size_warning(&g, 256, None).unwrap().unwrap();
         assert!(
             w.contains("chunk_tokens 256 is not a multiple of 400")
-                && w.contains("smallest valid chunk is 400 tokens"),
+                && w.contains("smallest valid chunk is 400 tokens")
+                && !w.contains("no chunk length"),
             "{w}"
         );
-        assert!(chunk_size_warning(&g, 800).is_none());
+        // From a Mooncake trace (512-token blocks) no chunk length can be a
+        // multiple of 400.
+        let w = chunk_size_warning(&g, 256, Some(512)).unwrap().unwrap();
+        assert!(
+            w.contains("no chunk length from this source is valid for this model at tp 8"),
+            "{w}"
+        );
+        assert!(chunk_size_warning(&g, 800, None).unwrap().is_none());
         g.tp = 1;
-        assert!(chunk_size_warning(&g, 256).unwrap().contains("784"));
+        let w = chunk_size_warning(&g, 256, Some(512)).unwrap().unwrap();
+        assert!(w.contains("784") && w.contains("no chunk length"), "{w}");
+        // A block that divides the source block: valid Mooncake chunks exist.
+        let mut h = cachesim::kvtrace::ModelSizes::explicit(10, 1000);
+        h.hybrid_pages = Some(cachesim::kvtrace::geometry::HybridPages {
+            kv_heads: 1,
+            kv_head_bytes_per_token: 1,
+            conv_dim: 0,
+            conv_state_tokens: 0,
+            conv_dtype_bytes: 1,
+            value_heads: 1,
+            recurrent_bytes_per_value_head: 64,
+        });
+        let small = Geometry::new(h);
+        assert_eq!(small.vllm_block_size(VLLM_KERNEL_ALIGNMENT), Some(64));
+        let w = chunk_size_warning(&small, 48, Some(512)).unwrap().unwrap();
+        assert!(!w.contains("no chunk length"), "{w}");
+        // An invalid tp is an error, not a warning.
+        g.tp = 3;
+        let err = chunk_size_warning(&g, 256, Some(512))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("KV heads"), "{err}");
         // Dense: no warning.
         let g = expand_args(&["--kv-bytes-per-token", "10"])
             .geometry()
             .unwrap();
-        assert!(chunk_size_warning(&g, 256).is_none());
+        assert!(chunk_size_warning(&g, 256, Some(512)).unwrap().is_none());
     }
 
     #[test]

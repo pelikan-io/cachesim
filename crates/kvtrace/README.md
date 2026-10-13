@@ -20,6 +20,11 @@ The `hf-fetch` feature (on by default) adds `hf::fetch_config`, which
 downloads a model's `config.json` from Hugging Face. With
 `default-features = false` the crate has no HTTP client.
 
+Dense and MLA geometry is checked against vLLM and LMCache. Hybrid
+(linear-attention) geometry is an approximation pending a follow-up: object
+sizes, the chunk length vLLM and LMCache allow, and the number of state
+snapshots differ from them; the `objects` module docs list the differences.
+
 kvtrace does not depend on the object-level trace format (`cachetrace`);
 `cachesim kv expand` combines the two. See the
 [cachesim README](https://github.com/pelikan-io/cachesim#readme) for the

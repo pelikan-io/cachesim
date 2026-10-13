@@ -278,7 +278,7 @@ The hybrid sizing is a simplified model, not LMCache v0.5.5's layout:
   one size, the attention pages plus the recurrent pages for the whole
   chunk, with null pages where no snapshot was taken
   (`multiprocess/modules/lmcache_driven_transfer.py:66-93`
-  `get_layout_desc`, `platform/cache_context.py:228`). Here a chunk without
+  `get_layout_desc`, `platform/cuda/cache_context.py:228`). Here a chunk without
   a snapshot is written at KV size only and one with a snapshot at KV plus
   one state, so the same id is written at two sizes
   (`kvtrace.multi_size_objects` counts them; this is an artefact of the
@@ -291,8 +291,12 @@ The hybrid sizing is a simplified model, not LMCache v0.5.5's layout:
   block is 544 tokens for Qwen3-Next-80B at TP 1, 272 at TP 4, and 400 for
   Qwen3.8-27B at TP 8 (784 at TP 1), so 256-token chunks are not valid for
   them. `kv expand` warns on stderr when `chunk_tokens` is not a multiple
-  of the block size and names the smallest valid chunk; it still sizes
-  objects for the trace's chunk length. At a valid chunk of k blocks, each
+  of the block size and names the smallest valid chunk; when the request
+  trace came from Mooncake, whose chunk lengths must divide 512, and no
+  such length is a multiple of the block size (true for all four values
+  above), the warning says no Mooncake chunk length is valid for the model
+  at that TP. It still sizes objects for the trace's chunk length, and an
+  invalid TP is reported as an error before any warning. At a valid chunk of k blocks, each
   recurrent object holds k pages per linear layer, each padded to the
   attention page size (`platforms/interface.py:1006-1009`); this model has
   one unpadded snapshot per object.
@@ -330,6 +334,16 @@ two write rules:
 - SET: the in-process remote backends put every object they are given
   without checking whether the store holds the key
   (`storage_backend/remote_backend.py:263-270`, `323-331`).
+
+For hybrid models only insert-if-absent applies in LMCache v0.5.5. vLLM
+requires its hybrid KV cache manager (HMA) for hybrid SSM models and fails at
+startup when the KV connector does not support it
+(`vllm/config/vllm.py:2251-2270`). Only LMCache's multiprocess connector
+declares that support (`lmcache/integration/vllm/lmcache_mp_connector.py:448`),
+and it uses insert-if-absent; the in-process connector that reaches the SET
+path does not (vLLM's `kv_connector/v1/lmcache_connector.py:68`; LMCache's
+adapter reads only `block_ids[0]`, `vllm_v1_adapter.py:168-179`). The SET
+examples here and below describe a store with that rule, not LMCache.
 
 Under SET the combined layout can lose a stored snapshot. With per-request
 state: A = [1, 2, 3] is stored, chunk 2 is evicted, B = [1, 2, 3, 4] misses
@@ -412,7 +426,9 @@ From a config (fields read from `text_config` when present):
   defaults to the model dtype (`vllm/model_executor/layers/mamba/mamba_utils.py:98-110`),
   and Qwen3-Next takes that path (`models/qwen3_next.py:879-887`).
   Convolution state is not counted. Size products that overflow 64 bits are
-  an error.
+  an error. Applying `mamba_ssm_dtype` whenever a config sets it is broader
+  than vLLM, where only the Qwen3.5 config class copies it; this is part of
+  the hybrid approximation.
 
 For example, Qwen/Qwen3-8B is 36 × 8 × 128 × 2 × 2 = 147,456 bytes per token.
 

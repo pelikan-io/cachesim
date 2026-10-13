@@ -137,7 +137,9 @@ impl ModelSizes {
     ///   level), else `dtype` (same order), else bfloat16.
     /// * State bytes per sequence: linear layers × `linear_num_value_heads` ×
     ///   `linear_key_head_dim` × `linear_value_head_dim` × state dtype bytes.
-    ///   The state dtype is `mamba_ssm_dtype`, else the model dtype
+    ///   The state dtype is `mamba_ssm_dtype` whenever the config sets it
+    ///   (broader than vLLM, where only the Qwen3.5 config class copies it;
+    ///   part of the hybrid approximation), else the model dtype
     ///   (`torch_dtype`, else `dtype`, else bfloat16; not `kv_dtype`).
     ///
     /// Products that overflow `u64` are an error.
