@@ -133,9 +133,14 @@ KV-cache traces have two levels:
    the ids of the request's full prefix chunks. It does not depend on a
    model.
 2. An object-level trace in the format above: one row per KV-cache object a
-   request reads, sized for one model geometry (sizes, tensor parallelism,
+   request writes, sized for one model geometry (sizes, tensor parallelism,
    recurrent-state placement), as an LLM serving engine with an external KV
-   store (LMCache-style) would read them.
+   store (LMCache-style) would look them up and store them.
+
+Dense and MLA geometry is checked against vLLM and LMCache, with the
+citations below. Hybrid (linear-attention) geometry is an approximation
+pending a follow-up; its known differences from vLLM and LMCache are listed
+under "Hybrid models" below.
 
 `cachesim convert -f mooncake` makes the first from a Mooncake trace;
 `cachesim kv expand` makes the second from the first.
@@ -220,7 +225,9 @@ writer rejects larger ids, and the reader rejects them with the file, row
 and `req_id`. Only `session_id` may be null; the reader rejects nulls in any
 other column or in a `chunks` item. Files from other Parquet writers can be
 read if they are uncompressed or compressed with snappy (pyarrow's default)
-or zstd; gzip, lz4 and brotli are not built in and fail to open.
+or zstd. gzip, lz4 and brotli codecs are not built in: such a file opens
+(the footer is not compressed) and fails at the first batch read, with a
+Parquet "Disabled feature at compile time" error.
 
 Footer key-value metadata: `kvtrace.format` = `requests`, `kvtrace.version` =
 `1`, `kvtrace.chunk_tokens` (every chunk's length), `kvtrace.created`,
@@ -258,14 +265,41 @@ Objects (defaults follow LMCache v0.5.5):
   model without recurrent state).
 - Hybrid models (linear-attention layers with a recurrent state):
   `--state-mode per-request` (default) stores one state snapshot at each
-  request's last chunk; `per-chunk` stores one at every chunk. Per-request
-  is the default because vLLM v0.31 snapshots the state only at some block
-  boundaries when prefix caching is on ("align" mode,
-  `vllm/config/cache.py:190-198`); per-chunk is the upper bound.
-  `--state-layout combined` (default) adds the state bytes to the chunk's
-  object; `separate` stores the state as its own object. vLLM pads the
-  state page to the attention page size (`platforms/interface.py:1006-1009`);
-  that padding is not modelled, and convolution state is not counted.
+  request's last chunk; `per-chunk` stores one at every chunk (the upper
+  bound). `--state-layout combined` (default) adds the state bytes to the
+  chunk's object; `separate` stores the state as its own object.
+  Convolution state is not counted in object sizes.
+
+#### Hybrid models: known differences
+
+The hybrid sizing is a simplified model, not LMCache v0.5.5's layout:
+
+- Sizes, `combined`: LMCache writes every chunk object of a hybrid model at
+  one size, the attention pages plus the recurrent pages for the whole
+  chunk, with null pages where no snapshot was taken
+  (`multiprocess/modules/lmcache_driven_transfer.py:66-93`
+  `get_layout_desc`, `platform/cache_context.py:228`). Here a chunk without
+  a snapshot is written at KV size only and one with a snapshot at KV plus
+  one state, so the same id is written at two sizes
+  (`kvtrace.multi_size_objects` counts them; this is an artefact of the
+  simplification) and the KV-only writes are smaller than LMCache's.
+- Chunk length: with prefix caching, vLLM v0.31 ("align" mode) raises the
+  attention block size until one layer's attention page is at least one
+  layer's recurrent page (`vllm/platforms/interface.py:960-994`), and LMCache
+  requires the chunk size to be a multiple of the block size
+  (`kv_layer_groups.py:750-755`). With a 16-token kernel alignment the
+  block is 544 tokens for Qwen3-Next-80B at TP 1, 272 at TP 4, and 400 for
+  Qwen3.8-27B at TP 8 (784 at TP 1), so 256-token chunks are not valid for
+  them. `kv expand` warns on stderr when `chunk_tokens` is not a multiple
+  of the block size and names the smallest valid chunk; it still sizes
+  objects for the trace's chunk length. At a valid chunk of k blocks, each
+  recurrent object holds k pages per linear layer, each padded to the
+  attention page size (`platforms/interface.py:1006-1009`); this model has
+  one unpadded snapshot per object.
+- Snapshot count: align mode snapshots at the last block boundary of each
+  scheduler step (`vllm/config/cache.py:190-198`), so a prompt longer than
+  `max_num_batched_tokens` gets several snapshots. `per-request` models one
+  per request and understates snapshots for long prompts.
 
 Columns of the expanded trace:
 
@@ -278,16 +312,31 @@ Columns of the expanded trace:
 | `op`                | `1` (GET) on every row                                 |
 | `ttl`               | null                                                   |
 
-Object ids are what the store keys objects on. With `combined`, LMCache keeps
-a chunk's attention and state pages in a single object group when
-`separate_object_groups` is off (the default) and stores it as one object
-keyed by the chunk (`kv_layer_groups.py:682-687`). So a chunk has one id per
-rank (slot 0) whether or not a write carries state, and that id can be
-written at two sizes: KV only, or KV and state. A write replaces the object,
-so a store holds the size of the last write it accepted. `obj_size` on each
-row is the size of that request's write; ids written at more than one size
-are counted in `kvtrace.multi_size_objects`. With `separate`, the state
-object has its own key (slot 1) next to the chunk's KV object (slot 0).
+Object ids are what the store keys objects on. With `combined`, LMCache has
+one object group per chunk when `separate_object_groups` is off (the
+default) and stores it as one object keyed by the chunk
+(`kv_layer_groups.py:682-687`). So a chunk has one id per rank (slot 0)
+whether or not a write carries state. Because of the simplified sizing
+above, that id can be written at two sizes; `obj_size` on each row is the
+size of that request's write. With `separate`, the state object has its own
+key (slot 1) next to the chunk's KV object (slot 0).
+
+Whether a write replaces a stored object depends on the store. LMCache has
+two write rules:
+
+- Insert-if-absent: the multiprocess store reserves only keys that are not
+  present (`reserve_write(..., "new")`, `distributed/storage_manager.py:182-200`,
+  `l1_manager.py:455-458`).
+- SET: the in-process remote backends put every object they are given
+  without checking whether the store holds the key
+  (`storage_backend/remote_backend.py:263-270`, `323-331`).
+
+Under SET the combined layout can lose a stored snapshot. With per-request
+state: A = [1, 2, 3] is stored, chunk 2 is evicted, B = [1, 2, 3, 4] misses
+at chunk 2 and writes chunks 2-4, replacing chunk 3's state-carrying object
+with a KV-only one; a repeat of A then reuses 0 tokens under SET and 768
+under insert-if-absent (256-token chunks). The separate layout keeps chunk
+3's state object, and A reuses 768 tokens either way.
 
 For a Mooncake trace, `chunk` is `block << 8 | sub-chunk`, so `obj_id` is
 `block << 24 | sub-chunk << 16 | slot << 12 | rank`. Every row is a GET: on a
@@ -297,17 +346,30 @@ prefix in order: per chunk, its rank objects, then its separate state
 objects.
 
 The rows are the objects each request writes: every chunk of its prefix.
-Which stored objects a later request can reuse is up to the consumer. For a
-model without recurrent state, any prefix of chunks found in the store is
-usable. For a hybrid model a prefix hit is usable only through the last
-chunk whose stored object carries state: the linear-attention layers need
-the state where computation resumes. kvtrace's `ObjectMapper::lookup_ids`
-gives the ids to probe at a chunk: with `combined` the one id, and the
-consumer must remember whether the write that stored it carried state
-(`KvObject::kind`, `ObjectKind::carries_state()`); with `separate` the KV id
-and the state id, and the chunk is resumable when the state id is present.
-A replay of the expanded trace with the object-level engines does not apply
-this rule; it counts a KV-only chunk hit as a hit.
+Which stored objects a later request can reuse is up to the consumer:
+
+- A chunk counts as present only if every storing rank's object is present,
+  so the usable prefix is the minimum over ranks. MLA models have one
+  storing rank (the first).
+- For a model without recurrent state, the whole present prefix is usable.
+- For a hybrid model, a prefix is usable only through the last present
+  chunk whose stored object carries state: the linear-attention layers need
+  the state where computation resumes. kvtrace's `ObjectMapper::lookup_ids`
+  gives the ids to probe at a chunk: with `combined` the one id, and the
+  consumer must remember whether the write that stored it carried state
+  (`KvObject::kind`, `ObjectKind::carries_state()`); with `separate` the KV
+  id and the state id, and the chunk is resumable when the state id is
+  present.
+- Chunks that are present but not resumable: under SET they are not
+  rewritten (they are inside the lookup's prefix hit); under
+  insert-if-absent only absent keys are written, so the separate layout can
+  add a snapshot to such a chunk and the combined layout cannot. With
+  per-request state, A = [1, 2, 3] and then [1, 2] twice: the second [1, 2]
+  reuses 512 tokens with `separate` under insert-if-absent, and nothing in
+  the other three cases.
+
+A replay of the expanded trace with the object-level engines applies none of
+these rules: it counts any chunk hit as a hit and fills on a miss.
 
 Model sizes come from one of:
 
