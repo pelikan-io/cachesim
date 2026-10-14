@@ -9,6 +9,9 @@
 //!
 //! `timestamp` is in milliseconds and each entry of `hash_ids` names one
 //! 512-token block of the prompt; equal ids mean equal prefix content.
+//! Lines must be in non-decreasing `timestamp` order, since a request
+//! trace is in arrival order; an earlier timestamp is an error naming the
+//! line. Equal timestamps are allowed, and common in the published traces.
 //!
 //! # Chunks
 //!
@@ -368,7 +371,7 @@ pub fn convert_mooncake(
                 summary.input_short_of_blocks.to_string(),
             ),
         ] {
-            writer.append_key_value_metadata(k, v);
+            writer.append_key_value_metadata(k, v)?;
         }
         if out.temp.is_some() {
             writer.finish_synced()?;

@@ -232,9 +232,12 @@ Parquet "Disabled feature at compile time" error.
 Rows are in arrival order: each `timestamp` is at least the previous row's.
 The writer rejects a request earlier than the one before it, and the reader
 rejects such a row with the file, row and `req_id`, so a consumer can replay
-the trace while reading it. `convert -f mooncake` therefore fails on a
-Mooncake file that is out of timestamp order; the three published Mooncake
-traces (conversation, toolagent, synthetic) are in order.
+the trace while reading it. Both checks (order, and a row's chunk count
+against `kvtrace.max_chunks`) run as each row is read, so a consumer gets
+the error at the offending row, after the rows before it. `convert -f
+mooncake` fails on a Mooncake file that is out of timestamp order; the
+three traces in kvcache-ai/Mooncake `FAST25-release/traces/` (conversation,
+toolagent, synthetic) are in order.
 
 Footer key-value metadata: `kvtrace.format` = `requests`, `kvtrace.version` =
 `1`, `kvtrace.chunk_tokens` (every chunk's length), `kvtrace.max_chunks` (the
