@@ -229,8 +229,16 @@ or zstd. gzip, lz4 and brotli codecs are not built in: such a file opens
 (the footer is not compressed) and fails at the first batch read, with a
 Parquet "Disabled feature at compile time" error.
 
+Rows are in arrival order: each `timestamp` is at least the previous row's.
+The writer rejects a request earlier than the one before it, and the reader
+rejects such a row with the file, row and `req_id`, so a consumer can replay
+the trace while reading it. `convert -f mooncake` therefore fails on a
+Mooncake file that is out of timestamp order; the three published Mooncake
+traces (conversation, toolagent, synthetic) are in order.
+
 Footer key-value metadata: `kvtrace.format` = `requests`, `kvtrace.version` =
-`1`, `kvtrace.chunk_tokens` (every chunk's length), `kvtrace.created`,
+`1`, `kvtrace.chunk_tokens` (every chunk's length), `kvtrace.max_chunks` (the
+most chunks in any request), `kvtrace.created`,
 `kvtrace.source.*` (source format, file name, SHA-256, block length),
 `kvtrace.converter.*` (chunk id rule, the counts above), `kvtrace.requests`
 and `kvtrace.chunks`.
@@ -593,8 +601,11 @@ are still built, through `arrow` and `parquet` (Parquet's ZSTD codec needs
 
 - **`Request`**, **`RequestWriter`**, **`RequestReader`**, **`request_schema()`**
   (`format`) — the request trace format described above. The reader checks
-  `kvtrace.format`, `kvtrace.version` and `kvtrace.chunk_tokens` and exposes
-  the footer metadata.
+  `kvtrace.format`, `kvtrace.version` and `kvtrace.chunk_tokens`, rejects
+  rows out of arrival order, and exposes the footer metadata.
+  `max_chunks()` gives the most chunks in any request, for sizing buffers
+  before reading: from `kvtrace.max_chunks` when the footer has it (a row
+  with more is an error), otherwise by reading the `chunks` column.
 - **`ModelSizes`** (`geometry`) — KV bytes per token and recurrent-state bytes
   per sequence, from a Hugging Face `config.json` (`from_config_file()`,
   `from_config_bytes()`, `from_config()`) or given directly (`explicit()`).

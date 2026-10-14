@@ -299,6 +299,7 @@ pub fn convert_mooncake(
         let mut summary = MooncakeSummary::default();
         let mut line = String::new();
         let mut lineno = 0;
+        let mut prev_timestamp = None;
         loop {
             line.clear();
             if reader.read_line(&mut line)? == 0 {
@@ -309,6 +310,15 @@ pub fn convert_mooncake(
                 continue;
             }
             let (mut req, agreement) = parse_request(&line, lineno, opts.chunk_tokens)?;
+            // The writer refuses this too; checking here names the line.
+            if let Some(prev) = prev_timestamp.filter(|&p| req.timestamp < p) {
+                return Err(Error::InvalidFormat(format!(
+                    "mooncake line {lineno}: timestamp {} ns is before the previous request's \
+                     {prev} ns; a request trace must be in arrival order",
+                    req.timestamp
+                )));
+            }
+            prev_timestamp = Some(req.timestamp);
             req.req_id = summary.requests;
             summary.requests += 1;
             summary.chunks += req.chunks.len() as u64;
@@ -608,6 +618,7 @@ mod tests {
             ("kvtrace.source.block_tokens", "512"),
             ("kvtrace.requests", "4"),
             ("kvtrace.chunks", "10"),
+            ("kvtrace.max_chunks", "4"),
             ("kvtrace.converter.requests_without_chunks", "0"),
             ("kvtrace.converter.input_beyond_blocks", "1"),
             ("kvtrace.converter.input_short_of_blocks", "1"),
@@ -640,6 +651,31 @@ mod tests {
             .unwrap();
         // The request without hash_ids is id 1 and has no chunks.
         assert_eq!(got, [(0, 1), (1, 0), (2, 2)]);
+    }
+
+    #[test]
+    fn out_of_order_timestamps_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("trace.jsonl");
+        std::fs::write(
+            &input,
+            "{\"timestamp\": 5, \"input_length\": 1, \"output_length\": 1, \"hash_ids\": [1]}\n\
+             {\"timestamp\": 5, \"input_length\": 1, \"output_length\": 1, \"hash_ids\": [1]}\n\
+             \n\
+             {\"timestamp\": 4, \"input_length\": 1, \"output_length\": 1, \"hash_ids\": [1]}\n",
+        )
+        .unwrap();
+        let out = dir.path().join("out.parquet");
+        let err = convert_mooncake(&input, &out, &MooncakeOptions::default(), 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "mooncake line 4: timestamp 4000000 ns is before the previous request's 5000000 ns"
+            ),
+            "{err}"
+        );
+        assert!(!out.exists());
     }
 
     #[test]
