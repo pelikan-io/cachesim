@@ -288,9 +288,9 @@ pub struct RequestReader {
     /// [`max_chunks`](Self::max_chunks) has run. Rows are checked against it
     /// once it is set.
     max_chunks: OnceCell<usize>,
-    /// For a file without [`KEY_MAX_CHUNKS`]: the file opened a second time,
-    /// so the scan reads the file that was opened even if the path is
-    /// replaced, and does not share a file offset with `batches`.
+    /// For a file without [`KEY_MAX_CHUNKS`]: a handle to the opened file, so
+    /// the scan reads it even if the path is replaced. It shares a file
+    /// offset with `batches`; parquet seeks before every read.
     scan_file: Option<File>,
     metadata: BTreeMap<String, String>,
     current: Option<Columns>,
@@ -391,7 +391,9 @@ impl RequestReader {
     /// has a `kvtrace.max_chunks` that is not an integer.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+        let file = File::open(path)?;
+        let scan_clone = file.try_clone()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let file_meta = builder.metadata().file_metadata();
         let metadata: BTreeMap<String, String> = file_meta
             .key_value_metadata()
@@ -434,7 +436,7 @@ impl RequestReader {
                 let _ = max_chunks.set(n);
                 None
             }
-            None => Some(File::open(path)?),
+            None => Some(scan_clone),
         };
         let total_requests = usize::try_from(file_meta.num_rows())
             .map_err(|_| bad("negative row count in footer".into()))?;
@@ -1100,7 +1102,9 @@ mod tests {
         a[4] = Arc::new(chunks.finish());
         write_nullable(&other, Compression::UNCOMPRESSED, a);
         std::fs::rename(&other, &path).unwrap();
+        assert_eq!(r.max_chunks.get(), None);
         assert_eq!(r.max_chunks().unwrap(), 2);
+        assert_eq!(r.max_chunks.get(), Some(&2));
         assert_eq!(r.max_chunks().unwrap(), 2);
         assert_eq!(r.count(), 2);
     }
