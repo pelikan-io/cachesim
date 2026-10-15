@@ -16,6 +16,14 @@
 //! them naming the file, row and `req_id`. No column may be null except
 //! `session_id`; [`RequestReader`] rejects a batch with nulls elsewhere.
 //!
+//! Rows are in arrival order: each `timestamp` is at least the previous
+//! row's. [`RequestWriter::write`] rejects a request that arrives before the
+//! previous one, and [`RequestReader`] rejects such a row. A consumer can
+//! therefore replay a trace as it reads it, without sorting it first. The
+//! reader checks order, and a row's chunk count against
+//! [`RequestReader::max_chunks`], as it reads each row: a consumer gets the
+//! error at the offending row, after the rows before it.
+//!
 //! Equal chunk ids mean equal prefix content. Every chunk covers the same
 //! number of tokens, given once per file by the `kvtrace.chunk_tokens`
 //! metadata key; tokens after the last full chunk are not represented.
@@ -27,10 +35,14 @@
 //! * `kvtrace.format` = `requests`
 //! * `kvtrace.version` = [`FORMAT_VERSION`]
 //! * `kvtrace.chunk_tokens`
+//! * `kvtrace.max_chunks`: the most chunks any request has, written by
+//!   [`RequestWriter::finish`]. Files from other writers may lack it;
+//!   [`RequestReader::max_chunks`] then reads the `chunks` column to find it.
 //!
 //! Converters add `kvtrace.created`, `kvtrace.source.*` (source format, file
 //! name, SHA-256) and `kvtrace.converter.*` (parameters and counts).
 
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
@@ -43,7 +55,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::Compression;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
@@ -59,6 +71,8 @@ pub const KEY_FORMAT: &str = "kvtrace.format";
 pub const KEY_VERSION: &str = "kvtrace.version";
 /// Metadata key: tokens per chunk.
 pub const KEY_CHUNK_TOKENS: &str = "kvtrace.chunk_tokens";
+/// Metadata key: the most chunks any request in the file has.
+pub const KEY_MAX_CHUNKS: &str = "kvtrace.max_chunks";
 /// Value of [`KEY_FORMAT`] in a request trace.
 pub const FORMAT_REQUESTS: &str = "requests";
 
@@ -112,6 +126,10 @@ pub struct RequestWriter {
     chunks: ListBuilder<UInt64Builder>,
     session_ids: Vec<Option<u64>>,
     batch_size: usize,
+    /// Timestamp of the last request written, for the order check.
+    last_timestamp: Option<i64>,
+    /// Most chunks in any request written, for [`KEY_MAX_CHUNKS`].
+    max_chunks: usize,
 }
 
 impl RequestWriter {
@@ -148,18 +166,34 @@ impl RequestWriter {
             chunks: ListBuilder::new(UInt64Builder::new()).with_field(chunk_item_field()),
             session_ids: Vec::with_capacity(batch_size),
             batch_size,
+            last_timestamp: None,
+            max_chunks: 0,
         })
     }
 
     /// Add a key-value pair to the file footer. Pairs appended any time
-    /// before [`finish`](Self::finish) are written.
-    pub fn append_key_value_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
+    /// before [`finish`](Self::finish) are written. Errors for
+    /// [`KEY_MAX_CHUNKS`], which `finish` writes from the requests.
+    pub fn append_key_value_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), Error> {
+        let key = key.into();
+        if key == KEY_MAX_CHUNKS {
+            return Err(Error::InvalidFormat(format!(
+                "kvtrace: {KEY_MAX_CHUNKS} is written by RequestWriter::finish"
+            )));
+        }
         self.writer
-            .append_key_value_metadata(KeyValue::new(key.into(), value.into()));
+            .append_key_value_metadata(KeyValue::new(key, value.into()));
+        Ok(())
     }
 
     /// Append one request (buffered; flushed in batches). Errors if a chunk
-    /// id is 2^48 or more, since it would not fit an object id.
+    /// id is 2^48 or more, since it would not fit an object id, or if the
+    /// request's timestamp is earlier than the previous request's. Nothing
+    /// is written for a request that errors.
     pub fn write(&mut self, r: &Request) -> Result<(), Error> {
         if let Some(&c) = r
             .chunks
@@ -172,6 +206,15 @@ impl RequestWriter {
                 crate::objects::CHUNK_ID_BITS
             )));
         }
+        if let Some(prev) = self.last_timestamp.filter(|&p| r.timestamp < p) {
+            return Err(Error::InvalidFormat(format!(
+                "kvtrace: request {} has timestamp {}, before the previous request's {prev}; \
+                 requests must be written in arrival order",
+                r.req_id, r.timestamp
+            )));
+        }
+        self.last_timestamp = Some(r.timestamp);
+        self.max_chunks = self.max_chunks.max(r.chunks.len());
         self.timestamps.push(r.timestamp);
         self.req_ids.push(r.req_id);
         self.input_tokens.push(r.input_tokens);
@@ -205,9 +248,17 @@ impl RequestWriter {
         Ok(())
     }
 
-    /// Flush buffered requests and close the file.
+    fn write_footer_metadata(&mut self) {
+        self.writer.append_key_value_metadata(KeyValue::new(
+            KEY_MAX_CHUNKS.to_string(),
+            self.max_chunks.to_string(),
+        ));
+    }
+
+    /// Flush buffered requests, write [`KEY_MAX_CHUNKS`], and close the file.
     pub fn finish(mut self) -> Result<(), Error> {
         self.flush_batch()?;
+        self.write_footer_metadata();
         self.writer.close()?;
         Ok(())
     }
@@ -216,6 +267,7 @@ impl RequestWriter {
     /// (`File::sync_all`).
     pub fn finish_synced(mut self) -> Result<(), Error> {
         self.flush_batch()?;
+        self.write_footer_metadata();
         self.writer.into_inner()?.sync_all()?;
         Ok(())
     }
@@ -232,6 +284,14 @@ pub struct RequestReader {
     batches: ParquetRecordBatchReader,
     total_requests: usize,
     chunk_tokens: u32,
+    /// [`KEY_MAX_CHUNKS`] from the footer, or the scan's result once
+    /// [`max_chunks`](Self::max_chunks) has run. Rows are checked against it
+    /// once it is set.
+    max_chunks: OnceCell<usize>,
+    /// For a file without [`KEY_MAX_CHUNKS`]: a handle to the opened file, so
+    /// the scan reads it even if the path is replaced. It shares a file
+    /// offset with `batches`; parquet seeks before every read.
+    scan_file: Option<File>,
     metadata: BTreeMap<String, String>,
     current: Option<Columns>,
     row_idx: usize,
@@ -240,6 +300,8 @@ pub struct RequestReader {
     path: std::path::PathBuf,
     /// Rows returned so far, for error messages.
     rows_read: u64,
+    /// Timestamp of the last row returned, for the order check.
+    last_timestamp: Option<i64>,
 }
 
 struct Columns {
@@ -325,10 +387,13 @@ impl Columns {
 
 impl RequestReader {
     /// Open a request trace. Errors if the file's metadata does not name
-    /// this format and version or lacks a positive `kvtrace.chunk_tokens`.
+    /// this format and version, lacks a positive `kvtrace.chunk_tokens`, or
+    /// has a `kvtrace.max_chunks` that is not an integer.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+        let file = File::open(path)?;
+        let scan_clone = file.try_clone()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let file_meta = builder.metadata().file_metadata();
         let metadata: BTreeMap<String, String> = file_meta
             .key_value_metadata()
@@ -362,6 +427,17 @@ impl RequestReader {
                     "{KEY_CHUNK_TOKENS} missing or not a positive integer"
                 ))
             })?;
+        let max_chunks = OnceCell::new();
+        let scan_file = match metadata.get(KEY_MAX_CHUNKS) {
+            Some(v) => {
+                let n = v
+                    .parse::<usize>()
+                    .map_err(|_| bad(format!("{KEY_MAX_CHUNKS} {v:?} is not an integer")))?;
+                let _ = max_chunks.set(n);
+                None
+            }
+            None => Some(scan_clone),
+        };
         let total_requests = usize::try_from(file_meta.num_rows())
             .map_err(|_| bad("negative row count in footer".into()))?;
         let batches = builder.with_batch_size(READ_BATCH_SIZE).build()?;
@@ -369,12 +445,15 @@ impl RequestReader {
             batches,
             total_requests,
             chunk_tokens,
+            max_chunks,
+            scan_file,
             metadata,
             current: None,
             row_idx: 0,
             failed: false,
             path: path.to_path_buf(),
             rows_read: 0,
+            last_timestamp: None,
         })
     }
 
@@ -391,6 +470,62 @@ impl RequestReader {
     /// The file's key-value metadata.
     pub fn metadata(&self) -> &BTreeMap<String, String> {
         &self.metadata
+    }
+
+    /// The most chunks any request in the file has, for sizing buffers
+    /// before reading the requests. Taken from `kvtrace.max_chunks` when the
+    /// footer has it; otherwise the first call reads the file's `chunks`
+    /// column and later calls return that result. Reading a row with more
+    /// chunks than the value is an error.
+    pub fn max_chunks(&self) -> Result<usize, Error> {
+        if let Some(&n) = self.max_chunks.get() {
+            return Ok(n);
+        }
+        let file = self
+            .scan_file
+            .as_ref()
+            .expect("opened in open() when the footer has no max_chunks")
+            .try_clone()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let root = builder
+            .parquet_schema()
+            .root_schema()
+            .get_fields()
+            .iter()
+            .position(|f| f.name() == "chunks")
+            .ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "{}: request trace has no chunks column",
+                    self.path.display()
+                ))
+            })?;
+        let mask = ProjectionMask::roots(builder.parquet_schema(), [root]);
+        let mut max = 0;
+        for batch in builder
+            .with_projection(mask)
+            .with_batch_size(READ_BATCH_SIZE)
+            .build()?
+        {
+            let batch = batch?;
+            let chunks = batch
+                .column_by_name("chunks")
+                .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+                .ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "{}: request trace column chunks is not a list",
+                        self.path.display()
+                    ))
+                })?;
+            let longest = chunks
+                .offsets()
+                .windows(2)
+                .map(|w| (w[1] - w[0]) as usize)
+                .max()
+                .unwrap_or(0);
+            max = max.max(longest);
+        }
+        let _ = self.max_chunks.set(max);
+        Ok(max)
     }
 
     fn next_batch(&mut self) -> Result<bool, Error> {
@@ -459,6 +594,26 @@ impl Iterator for RequestReader {
                 crate::objects::CHUNK_ID_BITS
             ))));
         }
+        if let Some(prev) = self.last_timestamp.filter(|&p| req.timestamp < p) {
+            self.failed = true;
+            return Some(Err(Error::InvalidFormat(format!(
+                "{}: row {row} (req_id {}) has timestamp {}, before the previous row's {prev}; \
+                 requests must be in arrival order",
+                self.path.display(),
+                req.req_id,
+                req.timestamp
+            ))));
+        }
+        self.last_timestamp = Some(req.timestamp);
+        if let Some(&max) = self.max_chunks.get().filter(|&&m| req.chunks.len() > m) {
+            self.failed = true;
+            return Some(Err(Error::InvalidFormat(format!(
+                "{}: row {row} (req_id {}) has {} chunks, more than {KEY_MAX_CHUNKS} {max}",
+                self.path.display(),
+                req.req_id,
+                req.chunks.len()
+            ))));
+        }
         Some(Ok(req))
     }
 }
@@ -498,7 +653,8 @@ mod tests {
 
     fn write(path: &Path, reqs: &[Request], batch: usize) {
         let mut w = RequestWriter::create(path, 256, batch).unwrap();
-        w.append_key_value_metadata("kvtrace.source.format", "test");
+        w.append_key_value_metadata("kvtrace.source.format", "test")
+            .unwrap();
         for r in reqs {
             w.write(r).unwrap();
         }
@@ -518,6 +674,8 @@ mod tests {
             assert_eq!(r.metadata()["kvtrace.source.format"], "test");
             assert_eq!(r.metadata()[KEY_FORMAT], "requests");
             assert_eq!(r.metadata()[KEY_VERSION], FORMAT_VERSION);
+            assert_eq!(r.metadata()[KEY_MAX_CHUNKS], "3");
+            assert_eq!(r.max_chunks().unwrap(), 3);
             let got: Vec<Request> = r.collect::<Result<_, _>>().unwrap();
             assert_eq!(got, sample(), "batch {batch}");
         }
@@ -585,6 +743,16 @@ mod tests {
     /// A file in the request schema but with every column nullable, as
     /// another writer might produce, with the given arrays.
     fn write_nullable(path: &Path, compression: Compression, arrays: Vec<ArrayRef>) {
+        write_nullable_with(path, compression, arrays, &[]);
+    }
+
+    /// [`write_nullable`] with extra footer metadata.
+    fn write_nullable_with(
+        path: &Path,
+        compression: Compression,
+        arrays: Vec<ArrayRef>,
+        extra: &[(&str, &str)],
+    ) {
         let item = Arc::new(Field::new("item", DataType::UInt64, true));
         let schema = Arc::new(Schema::new(vec![
             Field::new(
@@ -607,7 +775,10 @@ mod tests {
             (KEY_FORMAT, FORMAT_REQUESTS),
             (KEY_VERSION, FORMAT_VERSION),
             (KEY_CHUNK_TOKENS, "256"),
-        ] {
+        ]
+        .iter()
+        .chain(extra)
+        {
             w.append_key_value_metadata(KeyValue::new(k.to_string(), v.to_string()));
         }
         w.write(&RecordBatch::try_new(schema, arrays).unwrap())
@@ -761,6 +932,8 @@ mod tests {
             .join("tests/fixtures/requests/pyarrow-snappy.parquet");
         let r = RequestReader::open(&path).unwrap();
         assert_eq!(r.chunk_tokens(), 256);
+        assert!(!r.metadata().contains_key(KEY_MAX_CHUNKS));
+        assert_eq!(r.max_chunks().unwrap(), 2);
         let got: Vec<Request> = r.collect::<Result<_, _>>().unwrap();
         assert_eq!(
             got,
@@ -783,5 +956,156 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn writer_requires_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.parquet");
+        let mut w = RequestWriter::create(&path, 256, 16).unwrap();
+        let [a, b, c]: [Request; 3] = sample().try_into().unwrap();
+        w.write(&b).unwrap();
+        let err = w.write(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("request 0 has timestamp 1000000, before the previous request's 3000000"),
+            "{err}"
+        );
+        // An equal timestamp is in order, and the rejected request was not
+        // written.
+        w.write(&b).unwrap();
+        w.write(&c).unwrap();
+        w.finish().unwrap();
+        let got: Vec<u64> = RequestReader::open(&path)
+            .unwrap()
+            .map(|r| r.unwrap().req_id)
+            .collect();
+        assert_eq!(got, [1, 1, 7]);
+    }
+
+    #[test]
+    fn empty_trace_has_max_chunks_0() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.parquet");
+        RequestWriter::create(&path, 256, 16)
+            .unwrap()
+            .finish_synced()
+            .unwrap();
+        let r = RequestReader::open(&path).unwrap();
+        assert_eq!(r.metadata()[KEY_MAX_CHUNKS], "0");
+        assert_eq!(r.max_chunks().unwrap(), 0);
+    }
+
+    #[test]
+    fn reader_rejects_rows_out_of_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.parquet");
+        let mut a = arrays(None);
+        a[0] = Arc::new(TimestampNanosecondArray::from(vec![5, 4]).with_timezone("UTC"));
+        write_nullable(&path, Compression::UNCOMPRESSED, a);
+        let mut r = RequestReader::open(&path).unwrap();
+        assert_eq!(r.next().unwrap().unwrap().timestamp, 5);
+        let err = r.next().unwrap().unwrap_err().to_string();
+        assert!(
+            err.contains("order.parquet")
+                && err.contains("row 1 (req_id 1) has timestamp 4, before the previous row's 5"),
+            "{err}"
+        );
+        assert!(r.next().is_none());
+    }
+
+    #[test]
+    fn max_chunks_without_footer_key_reads_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nokey.parquet");
+        // Request 0 has 2 chunks, request 1 has 1.
+        write_nullable(&path, Compression::SNAPPY, arrays(None));
+        let r = RequestReader::open(&path).unwrap();
+        assert!(!r.metadata().contains_key(KEY_MAX_CHUNKS));
+        assert_eq!(r.max_chunks().unwrap(), 2);
+        assert_eq!(r.count(), 2);
+    }
+
+    #[test]
+    fn reader_rejects_a_row_longer_than_footer_max_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.parquet");
+        write_nullable_with(
+            &path,
+            Compression::UNCOMPRESSED,
+            arrays(None),
+            &[(KEY_MAX_CHUNKS, "1")],
+        );
+        let mut r = RequestReader::open(&path).unwrap();
+        assert_eq!(r.max_chunks().unwrap(), 1);
+        let err = r.next().unwrap().unwrap_err().to_string();
+        assert!(
+            err.contains("row 0 (req_id 0) has 2 chunks, more than kvtrace.max_chunks 1"),
+            "{err}"
+        );
+        assert!(r.next().is_none());
+
+        let path = dir.path().join("bad.parquet");
+        write_nullable_with(
+            &path,
+            Compression::UNCOMPRESSED,
+            arrays(None),
+            &[(KEY_MAX_CHUNKS, "lots")],
+        );
+        let err = RequestReader::open(&path).err().unwrap().to_string();
+        assert!(
+            err.contains("kvtrace.max_chunks \"lots\" is not an integer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn max_chunks_key_cannot_be_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.parquet");
+        let mut w = RequestWriter::create(&path, 256, 16).unwrap();
+        let err = w
+            .append_key_value_metadata(KEY_MAX_CHUNKS, "1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("written by RequestWriter::finish"), "{err}");
+        for r in sample() {
+            w.write(&r).unwrap();
+        }
+        w.finish().unwrap();
+        let r = RequestReader::open(&path).unwrap();
+        assert_eq!(r.max_chunks().unwrap(), 3);
+    }
+
+    /// Without the footer key, the scan reads the file that was opened even
+    /// after the path is replaced, and its result is kept. Unix only:
+    /// Windows refuses to replace a file that is open.
+    #[cfg(unix)]
+    #[test]
+    fn max_chunks_scan_reads_the_opened_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nokey.parquet");
+        // Request 0 has 2 chunks, request 1 has 1.
+        write_nullable(&path, Compression::UNCOMPRESSED, arrays(None));
+        let r = RequestReader::open(&path).unwrap();
+        // Replace the path with a file whose longest request has 3 chunks.
+        let other = dir.path().join("other.parquet");
+        let mut a = arrays(None);
+        let mut chunks = ListBuilder::new(UInt64Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::UInt64,
+            true,
+        )));
+        chunks.values().append_slice(&[1, 2, 3]);
+        chunks.append(true);
+        chunks.values().append_slice(&[4]);
+        chunks.append(true);
+        a[4] = Arc::new(chunks.finish());
+        write_nullable(&other, Compression::UNCOMPRESSED, a);
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(r.max_chunks.get(), None);
+        assert_eq!(r.max_chunks().unwrap(), 2);
+        assert_eq!(r.max_chunks.get(), Some(&2));
+        assert_eq!(r.max_chunks().unwrap(), 2);
+        assert_eq!(r.count(), 2);
     }
 }
