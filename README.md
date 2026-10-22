@@ -639,6 +639,13 @@ are still built, through `arrow` and `parquet` (Parquet's ZSTD codec needs
   trace, as described above. A KV simulation mode that replays request
   traces directly belongs here.
 
+#### `synth` module
+
+- **`generate()`** — writes a synthetic object-level trace from a
+  `GenSpec`: a `Pattern` (sequential passes over an id range, or a seeded
+  zipf stream), one op for every row (or a null op), and sizes chosen by
+  object id. `cachesim gen` is its CLI; see "`gen` options" below.
+
 #### `oracle` module
 
 Offline-optimal eviction policies that use the `next_access_vtime` column
@@ -684,6 +691,7 @@ theoretical upper bounds when evaluating online policies.
 | `convert`   | Import a trace to Parquet (binary, CSV, or Mooncake)         |
 | `info`      | Print summary statistics for a Parquet trace file            |
 | `kv expand` | Expand a KV-cache request trace into an object-level trace   |
+| `gen`       | Write a synthetic object-level trace from a pattern          |
 
 ## Usage
 
@@ -766,6 +774,64 @@ is required):
     --tp <N>                     Tensor-parallel degree [default: 1]
     --state-mode <MODE>          per-request | per-chunk [default: per-request]
     --state-layout <LAYOUT>      combined | separate [default: combined]
+```
+
+### `gen` options
+
+`cachesim gen sequential` writes passes over `start, start + stride, ...,
+start + (count - 1) * stride`; `cachesim gen zipf` writes `--requests` draws
+over `--keys` objects with exponent `--theta`, rank 1 (the most popular) as
+object id 0. Every row of a file has the one `--op`. An object's size is
+`sizes[id % number of --size values]`, so every row of an object has one size
+and repeating `--size` cycles sizes by id.
+
+Row `i` has timestamp `i * --interval-ns`; a pattern whose last timestamp
+would exceed `i64::MAX` is refused. `next_access_vtime` is computed as for `kv expand` (8 bytes per row
+and a map entry per object while generating) unless `--no-next-access` writes
+-1 everywhere. The pattern and its parameters are recorded in the footer as
+`cachesim.gen.*` metadata, with `--op` as spelled on the command line.
+
+The zipf stream is ChaCha8 (rand_chacha 0.10) from `--seed` driving
+rand_distr 0.6's Zipf sampler: a seed writes the same rows on one platform,
+but the sampler uses the platform's floating-point math library, so
+rows can differ between operating systems.
+
+The output is handled as for `kv expand`: a symlink is written through, a
+directory is refused, a device such as `/dev/null` is written directly, and a
+regular file is written to a temporary name beside it and renamed into place.
+Unlike `kv expand`, `gen` refuses an existing regular file unless `--force` is
+given, and a read-only file is refused even with `--force`. The output is
+opened before any rows are generated, so a process killed while generating
+leaves the temporary file.
+
+```
+sequential:
+    --start <ID>                 First object id [default: 0]
+    --count <N>                  Ids per pass (required)
+    --stride <N>                 Step between ids [default: 1]
+    --passes <N>                 Times the range is repeated [default: 1]
+zipf:
+    --keys <N>                   Objects in the key space (required)
+    --theta <F>                  Zipf exponent (required)
+    --requests <N>               Rows (required)
+    --seed <N>                   ChaCha8 seed [default: 0]
+both:
+-o, --output <PATH>              Output object-level trace (required)
+    --op <OP>                    get | set | del | none (required; none writes a null op,
+                                 which `simulate` reads as a GET)
+    --size <BYTES>               Object size; repeat to cycle sizes by id (required)
+    --interval-ns <N>            Timestamp step between rows [default: 1000]
+    --no-next-access             Write -1 for next_access_vtime
+    --force                      Replace an existing regular file at --output
+```
+
+A fill of alternating 4 KiB and 1 MiB objects, then a delete of the 1 MiB
+ones, as two files to replay one after the other:
+
+```bash
+cachesim gen sequential -o fill.parquet --op set --count 2000 --size 4096 --size 1048576
+cachesim gen sequential -o punch.parquet --op del --start 1 --stride 2 --count 1000 \
+    --size 4096 --size 1048576
 ```
 
 ### Simulate options

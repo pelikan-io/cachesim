@@ -41,14 +41,15 @@ crates/kvtrace/src/format.rs     Request trace schema, Request, RequestReader/Wr
 crates/kvtrace/src/geometry.rs   ModelSizes (config.json → sizes), Geometry, Sharding (TP checks)
 crates/kvtrace/src/objects.rs    ObjectMapper: request chunks → KvObject (obj_id, size, rank, kind, chunk_index); lookup_ids. obj_id = chunk<<16 | slot<<12 | rank: slot 0 = the chunk's object (combined layout: KV and KV+state writes share it, so one id can have two sizes), slot 1 = separate state object
 crates/kvtrace/src/mooncake.rs   Mooncake JSON lines → request trace (full chunks only, chunk_id)
-crates/kvtrace/src/output.rs     plan_output: output refusals, temp file + rename
+crates/kvtrace/src/output.rs     plan_output / plan_new_output (no input file): output refusals, temp file + rename
 crates/kvtrace/src/hf.rs         Hugging Face config.json fetch + cache (feature `hf-fetch`, default on)
 crates/kvtrace/tests/fixtures/   Mooncake trace, model configs (incl. DeepSeek-V3), a pyarrow-written request trace
 crates/cachesim/src/lib.rs       Policy enums (SegcachePolicy, CuckooPolicy), Error, `pub use cachetrace as trace`, `pub use kvtrace`
 crates/cachesim/src/kv.rs        expand_to_parquet: request trace + Geometry → object-level trace (KV simulation mode goes here)
 crates/cachesim/src/oracle.rs    OracleCache with Belady/BeladySize policies
 crates/cachesim/src/simulator.rs SimConfig/CuckooConfig, simulate_segcache()/simulate_cuckoo()/simulate_oracle(), SimResult
-crates/cachesim/src/main.rs      CLI (clap): simulate, convert, info, kv expand
+crates/cachesim/src/synth.rs     generate(): GenSpec (sequential or seeded zipf Pattern, one op, sizes by id) → object-level trace; `cachesim gen`
+crates/cachesim/src/main.rs      CLI (clap): simulate, convert, info, kv expand, gen
 crates/cachesim/tests/           api_paths.rs (old `cachesim::trace` paths); fixtures/ copies kvtrace fixtures used by kv.rs tests
 ```
 

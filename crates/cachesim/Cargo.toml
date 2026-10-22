@@ -22,6 +22,10 @@ clap = { version = "4", features = ["derive"] }
 cuckoo-cache = { version = "0.2.0", default-features = false }
 kvtrace = { path = "../kvtrace", version = "0.1.0", default-features = false }
 parquet.workspace = true
+# `cachesim gen`: the seeded zipf stream (ChaCha8 + rand_distr Zipf).
+rand = { version = "0.10", default-features = false }
+rand_chacha = "0.10"
+rand_distr = "0.6"
 segcache = { version = "0.4.4", default-features = false }
 thiserror.workspace = true
 

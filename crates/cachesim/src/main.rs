@@ -11,6 +11,7 @@ use cachesim::oracle::OraclePolicy;
 use cachesim::simulator::{
     simulate_cuckoo, simulate_oracle, simulate_segcache, CuckooConfig, SimConfig,
 };
+use cachesim::synth::{generate, GenSpec, Pattern};
 use cachesim::trace::{
     convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
 };
@@ -62,6 +63,97 @@ enum Command {
     /// KV-cache request traces (made by `convert -f mooncake`).
     #[command(subcommand)]
     Kv(KvCommand),
+
+    /// Write a synthetic object-level trace from a pattern.
+    #[command(subcommand)]
+    Gen(GenCommand),
+}
+
+#[derive(Subcommand)]
+enum GenCommand {
+    /// Passes over an arithmetic range of object ids:
+    /// start, start + stride, ..., start + (count - 1) * stride.
+    Sequential {
+        /// First object id.
+        #[arg(long, default_value_t = 0)]
+        start: u64,
+        /// Ids per pass.
+        #[arg(long)]
+        count: u64,
+        /// Step between ids; 2 from an odd start selects the odd ids.
+        #[arg(long, default_value_t = 1)]
+        stride: u64,
+        /// Times the range is repeated.
+        #[arg(long, default_value_t = 1)]
+        passes: u64,
+        #[command(flatten)]
+        common: GenArgs,
+    },
+    /// Zipf-distributed draws over `--keys` objects; rank 1 (the most popular)
+    /// is object id 0.
+    Zipf {
+        /// Objects in the key space.
+        #[arg(long)]
+        keys: u64,
+        /// Zipf exponent (YCSB's theta).
+        #[arg(long)]
+        theta: f64,
+        /// Rows to write.
+        #[arg(long)]
+        requests: u64,
+        /// ChaCha8 seed; on one platform the same seed writes the same rows.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        #[command(flatten)]
+        common: GenArgs,
+    },
+}
+
+/// Options every `gen` pattern takes.
+#[derive(Args)]
+struct GenArgs {
+    /// Output object-level trace (Parquet).
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Every row's operation; `none` writes a null op, which `cachesim
+    /// simulate` reads as a GET.
+    #[arg(long, value_enum)]
+    op: GenOpArg,
+    /// Object size in bytes. Repeat to cycle sizes by object id
+    /// (`id % number of sizes`), so every row of an object has one size.
+    #[arg(long = "size", required = true, value_name = "BYTES")]
+    sizes: Vec<u32>,
+    /// Timestamp step between rows, in nanoseconds.
+    #[arg(long, default_value_t = 1_000)]
+    interval_ns: u64,
+    /// Write -1 for every next_access_vtime. Computing it holds 8 bytes per
+    /// row and a map entry per object.
+    #[arg(long)]
+    no_next_access: bool,
+    /// Replace an existing regular file at the output path (a read-only file is
+    /// still refused).
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GenOpArg {
+    Get,
+    Set,
+    Del,
+    None,
+}
+
+impl GenOpArg {
+    fn op(self) -> Option<cachesim::trace::Op> {
+        use cachesim::trace::Op;
+        match self {
+            Self::Get => Some(Op::Get),
+            Self::Set => Some(Op::Set),
+            Self::Del => Some(Op::Delete),
+            Self::None => None,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -689,6 +781,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Expanded to {} entries → {}", s.rows, output.display());
         }
 
+        Command::Gen(cmd) => {
+            let (pattern, common) = match cmd {
+                GenCommand::Sequential {
+                    start,
+                    count,
+                    stride,
+                    passes,
+                    common,
+                } => (
+                    Pattern::Sequential {
+                        start,
+                        count,
+                        stride,
+                        passes,
+                    },
+                    common,
+                ),
+                GenCommand::Zipf {
+                    keys,
+                    theta,
+                    requests,
+                    seed,
+                    common,
+                } => (
+                    Pattern::Zipf {
+                        keys,
+                        theta,
+                        requests,
+                        seed,
+                    },
+                    common,
+                ),
+            };
+            let spec = GenSpec {
+                pattern,
+                op: common.op.op(),
+                sizes: common.sizes,
+                interval_ns: common.interval_ns,
+                next_access: !common.no_next_access,
+            };
+            let s = generate(&spec, &common.output, common.force, 65_536)?;
+            match s.objects {
+                Some(objects) => eprintln!(
+                    "Generated {} rows over {objects} objects → {}",
+                    s.rows,
+                    common.output.display()
+                ),
+                None => eprintln!("Generated {} rows → {}", s.rows, common.output.display()),
+            }
+        }
+
         Command::Info { trace } => {
             check_object_trace(&trace)?;
             let reader = TraceReader::open(&trace)?;
@@ -934,5 +1077,72 @@ mod tests {
         assert_eq!(g.model_name.as_deref(), Some("m"));
         let err = expand_args(&[]).geometry().unwrap_err().to_string();
         assert!(err.contains("needs one of"), "{err}");
+    }
+
+    #[test]
+    fn gen_maps_ops_and_repeated_sizes() {
+        use cachesim::trace::Op;
+        for (arg, want) in [
+            ("get", Some(Op::Get)),
+            ("set", Some(Op::Set)),
+            ("del", Some(Op::Delete)),
+            ("none", None),
+        ] {
+            let cli = Cli::try_parse_from([
+                "cachesim",
+                "gen",
+                "sequential",
+                "-o",
+                "x",
+                "--op",
+                arg,
+                "--count",
+                "2",
+                "--size",
+                "1",
+                "--size",
+                "2",
+            ])
+            .unwrap();
+            let Command::Gen(GenCommand::Sequential { common, count, .. }) = cli.command else {
+                panic!("not gen sequential");
+            };
+            assert_eq!(common.op.op(), want, "{arg}");
+            assert_eq!(common.sizes, vec![1, 2]);
+            assert_eq!(count, 2);
+        }
+        // --op and --size are required.
+        assert!(Cli::try_parse_from([
+            "cachesim",
+            "gen",
+            "zipf",
+            "-o",
+            "x",
+            "--keys",
+            "1",
+            "--theta",
+            "1",
+            "--requests",
+            "1",
+            "--size",
+            "1"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cachesim",
+            "gen",
+            "zipf",
+            "-o",
+            "x",
+            "--keys",
+            "1",
+            "--theta",
+            "1",
+            "--requests",
+            "1",
+            "--op",
+            "get"
+        ])
+        .is_err());
     }
 }

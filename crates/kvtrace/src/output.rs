@@ -81,26 +81,50 @@ pub fn plan_output(
     input_meta: &std::fs::Metadata,
     output: &Path,
 ) -> Result<OutputPlan, Error> {
-    let refuse = |what: &str| Error::InvalidFormat(format!("output {} {what}", output.display()));
-    let is_link = std::fs::symlink_metadata(output).is_ok_and(|m| m.file_type().is_symlink());
-    let dest = if is_link {
-        std::fs::canonicalize(output)
-            .map_err(|e| refuse(&format!("is a symlink that cannot be resolved: {e}")))?
-    } else {
-        output.to_path_buf()
-    };
+    let dest = resolve(output)?;
     if same_file(input, input_meta, &dest) {
-        return Err(refuse("is the input file"));
+        return Err(refusal(output, "is the input file"));
     }
+    plan_dest(output, dest)
+}
+
+/// [`plan_output`] for a writer with no input file, such as a generator: the
+/// same rules without the input-file check.
+pub fn plan_new_output(output: &Path) -> Result<OutputPlan, Error> {
+    plan_dest(output, resolve(output)?)
+}
+
+fn refusal(output: &Path, what: &str) -> Error {
+    Error::InvalidFormat(format!("output {} {what}", output.display()))
+}
+
+/// `output`, or the file it links to.
+fn resolve(output: &Path) -> Result<PathBuf, Error> {
+    let is_link = std::fs::symlink_metadata(output).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link {
+        std::fs::canonicalize(output).map_err(|e| {
+            refusal(
+                output,
+                &format!("is a symlink that cannot be resolved: {e}"),
+            )
+        })
+    } else {
+        Ok(output.to_path_buf())
+    }
+}
+
+fn plan_dest(output: &Path, dest: PathBuf) -> Result<OutputPlan, Error> {
     match std::fs::metadata(&dest) {
-        Ok(m) if m.is_dir() => return Err(refuse("is a directory")),
+        Ok(m) if m.is_dir() => return Err(refusal(output, "is a directory")),
         Ok(m) if !m.is_file() => return Ok(OutputPlan { dest, temp: None }),
-        Ok(m) if m.permissions().readonly() => return Err(refuse("exists and is read-only")),
+        Ok(m) if m.permissions().readonly() => {
+            return Err(refusal(output, "exists and is read-only"))
+        }
         _ => {}
     }
     let name = dest
         .file_name()
-        .ok_or_else(|| refuse("has no file name"))?
+        .ok_or_else(|| refusal(output, "has no file name"))?
         .to_string_lossy()
         .into_owned();
     let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

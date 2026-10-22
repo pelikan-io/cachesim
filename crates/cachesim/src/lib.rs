@@ -1,6 +1,7 @@
 pub mod kv;
 pub mod oracle;
 pub mod simulator;
+pub mod synth;
 
 /// The object-level trace format, now the `cachetrace` crate. Re-exported
 /// here so `cachesim::trace::*` paths from earlier releases keep compiling.
