@@ -13,7 +13,8 @@ use cachesim::simulator::{
 };
 use cachesim::synth::{generate, GenSpec, Pattern};
 use cachesim::trace::{
-    convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat, TraceReader,
+    convert_bin_to_parquet, convert_cache_trace_to_parquet, convert_meta_kv_to_parquet, BinFormat,
+    TraceReader,
 };
 use cachesim::{CuckooPolicy, SegcachePolicy};
 
@@ -565,6 +566,8 @@ enum InputFormatArg {
     OracleGeneralOpNs,
     /// pelikan-io/cache-trace CSV (optionally zstd-compressed)
     CacheTrace,
+    /// Meta key-value cache trace CSV, 202401 release (optionally zstd-compressed)
+    MetaKv,
     /// Mooncake trace (JSON lines), to a KV-cache request trace
     Mooncake,
 }
@@ -730,6 +733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 InputFormatArg::CacheTrace => {
                     convert_cache_trace_to_parquet(&input, &output, 65_536)?
                 }
+                InputFormatArg::MetaKv => convert_meta_kv_to_parquet(&input, &output, 65_536)?,
                 InputFormatArg::Mooncake => {
                     let opts = mooncake.options();
                     let s = convert_mooncake(&input, &output, &opts, 65_536)?;

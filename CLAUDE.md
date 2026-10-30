@@ -6,7 +6,7 @@ Cache trace simulator (`cachesim-rs`) for the [cache-rs](https://github.com/peli
 
 Cargo workspace (virtual root `Cargo.toml`, shared versions in `[workspace.dependencies]`):
 
-- `crates/cachetrace` — object-level trace format: Parquet schema, `TraceEntry`, `Op`, `TraceReader`/`TraceWriter`. Importers (libCacheSim binary, cache-trace CSV) behind the `import` feature, default on; the core must build with `--no-default-features` with no direct dependency on `ahash`/`zstd` (both still build through arrow/parquet). `cachetrace::Error` is `#[non_exhaustive]`.
+- `crates/cachetrace` — object-level trace format: Parquet schema, `TraceEntry`, `Op`, `TraceReader`/`TraceWriter`. Importers (libCacheSim binary, cache-trace CSV, Meta key-value CSV) behind the `import` feature, default on; the core must build with `--no-default-features` with no direct dependency on `ahash`/`zstd` (both still build through arrow/parquet). `cachetrace::Error` is `#[non_exhaustive]`.
 - `crates/kvtrace` — KV-cache request traces: request-level Parquet format, model geometry (HF config → sizes, TP sharding), request → objects mapping (`ObjectMapper`), Mooncake converter, HF fetch behind `hf-fetch` (default on). Must not depend on `cachetrace`, and must build with `--no-default-features` (no HTTP client): a load generator depends on it for keys and value sizes. `kvtrace::Error` is `#[non_exhaustive]`.
 - `crates/cachesim` — package `cachesim-rs` (published on crates.io), library `cachesim`, binary `cachesim`. Depends on both. Re-exports `cachetrace` as `cachesim::trace` (keep that path working) and `kvtrace` as `cachesim::kvtrace`. `kv::expand_to_parquet` turns a request trace into an object-level trace. Publish `cachetrace` and `kvtrace` before `cachesim-rs`.
 - Rust edition 2021, Apache-2.0
@@ -36,7 +36,7 @@ CI runs on ubuntu, macos, and windows. All four checks (lint, 3x build-and-test)
 
 ```
 crates/cachetrace/src/lib.rs     TraceEntry, Op, trace_schema(), TraceReader/Writer, Error
-crates/cachetrace/src/import.rs  libCacheSim binary + cache-trace CSV importers (feature `import`)
+crates/cachetrace/src/import.rs  libCacheSim binary, cache-trace CSV and Meta key-value CSV importers (feature `import`)
 crates/kvtrace/src/format.rs     Request trace schema, Request, RequestReader/Writer, kvtrace.* metadata keys
 crates/kvtrace/src/geometry.rs   ModelSizes (config.json → sizes), Geometry, Sharding (TP checks)
 crates/kvtrace/src/objects.rs    ObjectMapper: request chunks → KvObject (obj_id, size, rank, kind, chunk_index); lookup_ids. obj_id = chunk<<16 | slot<<12 | rank: slot 0 = the chunk's object (combined layout: KV and KV+state writes share it, so one id can have two sizes), slot 1 = separate state object
@@ -83,7 +83,7 @@ Each engine has its own config struct, simulation function, and policy enum:
 
 ### Trace format
 
-Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `obj_size` (u32), `next_access_vtime` (i64). Optional: `op` (u8), `ttl` (i32). Import from libCacheSim binary or pelikan-io/cache-trace CSV via `convert`.
+Parquet with ZSTD compression. Core columns: `timestamp` (ns), `obj_id` (u64), `obj_size` (u32), `next_access_vtime` (i64). Optional: `op` (u8), `ttl` (i32). Import from libCacheSim binary, pelikan-io/cache-trace CSV or Meta key-value CSV via `convert`.
 
 KV-cache request traces (kvtrace): one row per request with `chunks` list<u64> of full-chunk ids (< 2^48, enforced by the writer); rows in non-decreasing `timestamp` order (writer and reader enforce it, so consumers can stream); `chunk_tokens` and `max_chunks` are file metadata (`RequestReader::max_chunks()` scans the column when a file lacks the key); no object sizes; only `session_id` may be null (the reader rejects other nulls). `convert -f mooncake` writes one; `kv expand` maps it to object rows with a model geometry. `ObjectMapper` lists the objects a request writes; reuse rules (min over ranks; hybrid: resume only at a state-carrying chunk) and the store's write rule (SET vs insert-if-absent) belong to consumers. Dense/MLA geometry is checked against vLLM/LMCache; hybrid sizing is an approximation (one size per chunk object in LMCache, block-size constraint via `Geometry::vllm_block_size`, one snapshot per request) pending a follow-up; keep the docs saying so. Parquet's `snap` feature is on so files from pyarrow (snappy by default) open.
 

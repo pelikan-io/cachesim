@@ -16,8 +16,9 @@
 //! The core of the crate is the schema ([`trace_schema`]), the row type
 //! ([`TraceEntry`], [`Op`]), [`TraceReader`] and [`TraceWriter`]. The `import`
 //! cargo feature (on by default) adds conversion from libCacheSim binary
-//! traces and [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace)
-//! CSV files (optionally zstd-compressed). Build with
+//! traces, [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace)
+//! CSV files and Meta's key-value cache trace CSV files (both optionally
+//! zstd-compressed). Build with
 //! `default-features = false` to leave the importers out; that removes this
 //! crate's direct dependencies on `ahash` and `zstd`, but both are still
 //! built through `arrow` and `parquet`.
@@ -41,7 +42,9 @@ use parquet::file::properties::WriterProperties;
 #[cfg(feature = "import")]
 mod import;
 #[cfg(feature = "import")]
-pub use import::{convert_bin_to_parquet, convert_cache_trace_to_parquet, BinFormat};
+pub use import::{
+    convert_bin_to_parquet, convert_cache_trace_to_parquet, convert_meta_kv_to_parquet, BinFormat,
+};
 
 // ---------------------------------------------------------------------------
 // Errors

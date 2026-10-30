@@ -18,7 +18,7 @@ BeladySize — as theoretical baselines.
 Traces are stored on disk as [Parquet](https://parquet.apache.org/) files, and
 cachesim can import libCacheSim's binary trace formats,
 [pelikan-io/cache-trace](https://github.com/pelikan-io/cache-trace) CSV files,
-and the public [Mooncake](https://github.com/kvcache-ai/Mooncake) LLM serving
+Meta's key-value cache trace CSV files, and the public [Mooncake](https://github.com/kvcache-ai/Mooncake) LLM serving
 traces (as KV-cache request traces, which `cachesim kv expand` turns into
 object traces for a given model).
 
@@ -124,6 +124,50 @@ Field mapping during import:
 | `operation`   | `op`                 | string -> `req_op_e` integer                |
 | `ttl`         | `ttl`                | 0 -> null, >0 -> Some                       |
 | —             | `next_access_vtime`  | set to `-1` (not available in CSV)          |
+
+### Meta key-value cache trace CSV
+
+cachesim imports the 202401 release of the key-value cache traces Meta
+publishes for
+[CacheLib](https://cachelib.org/docs/Cache_Library_User_Guides/Cachebench_FB_HW_eval/)
+(`kvcache_traces_*.csv`). Files with a `.zst` extension are decompressed
+automatically. The 202206 release has other columns and is rejected.
+
+CSV columns, after a header row:
+
+```
+op_time,key,key_size,op,op_count,size,cache_hits,ttl,usecase,sub_usecase
+```
+
+A row stands for `op_count` requests to one key in one second, and is
+written as `op_count` rows with the same timestamp.
+
+| CSV field     | Parquet column       | Transformation                                   |
+|---------------|----------------------|--------------------------------------------------|
+| `op_time`     | `timestamp`          | seconds -> nanoseconds (`* 1_000_000_000`); negative or past i64 ns is an error |
+| `key`         | `obj_id`             | the 16-digit hex value; other keys hashed (ahash, fixed seed) |
+| `key_size`    | `obj_size` (partial) | `key_size + size`                                |
+| `op`          | `op`                 | `GET`, `GET_LEASE` -> GET; `SET`, `SET_LEASE` -> SET; `DELETE` -> DELETE |
+| `op_count`    | —                    | number of rows written                           |
+| `size`        | `obj_size` (partial) | 0 (a GET miss or a DELETE) -> the key's size, see below |
+| `cache_hits`  | —                    | not stored                                       |
+| `ttl`         | `ttl`                | 0 -> null, >0 -> Some                            |
+| `usecase`, `sub_usecase` | —         | not stored                                       |
+| —             | `next_access_vtime`  | set to `-1`                                      |
+
+A GET miss and every DELETE record `size` 0. Such a row takes the key's
+value size from its most recent row with a size, or, when there is none
+yet, from the first row after it with one; a key that never has a size
+keeps 0, so its `obj_size` is `key_size`. The importer reads the input
+twice to do this, so the input must be a regular file, not a pipe. It
+holds one map entry per key with a size.
+
+Day 1 of the release (`kvcache_traces_1.csv.zst`) has 154,604,153 rows
+standing for 281,577,413 requests to 19,087,078 keys over 86,520 s, and
+35,079,591 size-0 GET and GET_LEASE rows. 2,335,801 keys (12.2%) never
+have a size; they take 10,465,374 requests (3.7%), 8,674,087 of them GET
+misses. Its conversion took 191 s and peaked at 1.04 GB resident on an
+Apple M4 Max.
 
 ### Mooncake traces and KV-cache request traces
 
@@ -482,7 +526,7 @@ crates/
 ├── cachetrace/          # Object-level trace format (library)
 │   └── src/
 │       ├── lib.rs       # Schema, TraceEntry, Op, TraceReader, TraceWriter, Error
-│       └── import.rs    # libCacheSim binary and cache-trace CSV importers (`import` feature)
+│       └── import.rs    # libCacheSim binary, cache-trace CSV and Meta KV CSV importers (`import` feature)
 ├── kvtrace/             # KV-cache request traces and model geometry (library)
 │   ├── src/
 │   │   ├── lib.rs       # Error, re-exports, SHA-256 and timestamp helpers
@@ -593,6 +637,8 @@ With the `import` feature (on by default):
   format to Parquet.
 - **`convert_cache_trace_to_parquet()`** — streaming conversion from
   pelikan-io/cache-trace CSV (with auto zstd decompression) to Parquet.
+- **`convert_meta_kv_to_parquet()`** — two-pass conversion from Meta's
+  key-value cache trace CSV (with auto zstd decompression) to Parquet.
 
 `cachetrace = { version = "0.1", default-features = false }` gives the
 schema, row type, reader and writer only: the importer code and cachetrace's
@@ -688,7 +734,7 @@ theoretical upper bounds when evaluating online policies.
 | Command     | Description                                                  |
 |-------------|--------------------------------------------------------------|
 | `simulate`  | Replay a Parquet trace against segcache, cuckoo, or oracle   |
-| `convert`   | Import a trace to Parquet (binary, CSV, or Mooncake)         |
+| `convert`   | Import a trace to Parquet (binary, CSV, Meta CSV, or Mooncake) |
 | `info`      | Print summary statistics for a Parquet trace file            |
 | `kv expand` | Expand a KV-cache request trace into an object-level trace   |
 | `gen`       | Write a synthetic object-level trace from a pattern          |
@@ -701,6 +747,9 @@ cachesim convert -i trace.oracleGeneral.bin -o trace.parquet
 
 # Convert a pelikan-io/cache-trace CSV (zstd-compressed)
 cachesim convert -i cluster001.zst -o cluster001.parquet -f cache-trace
+
+# Convert a Meta key-value cache trace (202401 release)
+cachesim convert -i kvcache_traces_1.csv.zst -o meta-kv-1.parquet -f meta-kv
 
 # Convert a Mooncake trace to a KV-cache request trace (256-token chunks)
 cachesim convert -i conversation_trace.jsonl -o conv-requests.parquet -f mooncake
@@ -742,7 +791,7 @@ cachesim info -t trace.parquet
 ```
 -i, --input <PATH>         Input trace file (required)
 -o, --output <PATH>        Output Parquet file (required)
--f, --format <FORMAT>      oracle-general | oracle-general-op-ns | cache-trace | mooncake
+-f, --format <FORMAT>      oracle-general | oracle-general-op-ns | cache-trace | meta-kv | mooncake
                            [default: oracle-general]
 ```
 
