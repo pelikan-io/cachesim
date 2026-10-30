@@ -1,7 +1,9 @@
-//! Importers: libCacheSim binary traces and pelikan-io/cache-trace CSV.
+//! Importers: libCacheSim binary traces, pelikan-io/cache-trace CSV and
+//! Meta's key-value cache trace CSV.
 //!
 //! Built with the `import` cargo feature (on by default).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead, BufReader, Read};
@@ -212,6 +214,189 @@ fn bad_csv(msg: &str) -> Error {
     Error::InvalidFormat(format!("cache-trace CSV: {msg}"))
 }
 
+// ---------------------------------------------------------------------------
+// Meta key-value cache trace CSV import
+// ---------------------------------------------------------------------------
+
+/// The header of Meta's 202401 key-value cache traces.
+const META_KV_HEADER: &str =
+    "op_time,key,key_size,op,op_count,size,cache_hits,ttl,usecase,sub_usecase";
+
+/// Convert a Meta key-value cache trace (the 202401 release, CacheLib's
+/// `kvcache_traces_*.csv`) to Parquet.
+///
+/// CSV columns, with a header line:
+/// `op_time,key,key_size,op,op_count,size,cache_hits,ttl,usecase,sub_usecase`
+///
+/// * A row stands for `op_count` requests to one key in one second; it is
+///   written as `op_count` entries with the same timestamp.
+/// * `op_time` (seconds) is widened to nanoseconds.
+/// * `key` is a 16-digit hex hash and is used as `obj_id`; a key that is
+///   not hex is hashed via ahash (fixed seed).
+/// * `GET` and `GET_LEASE` become [`Op::Get`], `SET` and `SET_LEASE`
+///   [`Op::Set`], `DELETE` [`Op::Delete`]; anything else [`Op::Invalid`].
+/// * `obj_size` = `key_size + size`. A miss records `size` 0; such a row
+///   takes the key's size from its most recent row with a size, or, if it
+///   has none yet, from the first one after it. A key that never has a size
+///   keeps 0.
+/// * `ttl` 0 becomes null. `cache_hits`, `usecase` and `sub_usecase` are
+///   dropped; `next_access_vtime` is `-1`.
+/// * Files with a `.zst` extension are decompressed automatically.
+///
+/// The input is read twice: once for each key's first size, once to write.
+/// The size map holds one entry per key that has a size.
+///
+/// Returns the number of entries written.
+pub fn convert_meta_kv_to_parquet(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    batch_size: usize,
+) -> Result<usize, Error> {
+    let path = input.as_ref();
+    let hash_state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+
+    let mut sizes: HashMap<u64, u32, ahash::RandomState> =
+        HashMap::with_hasher(ahash::RandomState::with_seeds(0, 0, 0, 0));
+    for_each_meta_kv_row(path, &hash_state, |row| {
+        if row.value_size > 0 {
+            sizes.entry(row.obj_id).or_insert(row.value_size);
+        }
+        Ok(())
+    })?;
+
+    let mut writer = TraceWriter::create(output, batch_size)?;
+    let mut count: usize = 0;
+    for_each_meta_kv_row(path, &hash_state, |row| {
+        let value_size = if row.value_size > 0 {
+            sizes.insert(row.obj_id, row.value_size);
+            row.value_size
+        } else {
+            sizes.get(&row.obj_id).copied().unwrap_or(0)
+        };
+        let entry = TraceEntry {
+            timestamp: row.timestamp_secs * NANOS_PER_SEC,
+            obj_id: row.obj_id,
+            obj_size: row.key_size.saturating_add(value_size),
+            next_access_vtime: -1,
+            op: Some(row.op as u8),
+            ttl: row.ttl,
+        };
+        for _ in 0..row.op_count {
+            writer.write(&entry)?;
+        }
+        count += row.op_count as usize;
+        Ok(())
+    })?;
+
+    writer.finish()?;
+    Ok(count)
+}
+
+/// One row of a Meta key-value cache trace.
+#[derive(Debug)]
+struct MetaKvRow {
+    timestamp_secs: i64,
+    obj_id: u64,
+    key_size: u32,
+    op: Op,
+    op_count: u32,
+    value_size: u32,
+    ttl: Option<i32>,
+}
+
+/// Call `f` with each row of the Meta trace at `path`, after checking its
+/// header.
+fn for_each_meta_kv_row(
+    path: &Path,
+    hash_state: &ahash::RandomState,
+    mut f: impl FnMut(MetaKvRow) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut lines = open_text(path)?.lines();
+    let header = lines.next().transpose()?.unwrap_or_default();
+    if header.trim_end() != META_KV_HEADER {
+        return Err(bad_meta_kv(&format!(
+            "header is '{}', expected '{META_KV_HEADER}' (the 202401 release)",
+            header.trim_end()
+        )));
+    }
+    for line_result in lines {
+        let line = line_result?;
+        if line.is_empty() {
+            continue;
+        }
+        f(parse_meta_kv_line(&line, hash_state)?)?;
+    }
+    Ok(())
+}
+
+/// A text file, decompressed if its extension is `.zst` or `.zstd`.
+fn open_text(path: &Path) -> Result<Box<dyn BufRead>, Error> {
+    let file = File::open(path)?;
+    Ok(
+        if path.extension().is_some_and(|e| e == "zst" || e == "zstd") {
+            Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
+        } else {
+            Box::new(BufReader::new(file))
+        },
+    )
+}
+
+/// Parse one data line of a Meta key-value cache trace.
+fn parse_meta_kv_line(line: &str, hash_state: &ahash::RandomState) -> Result<MetaKvRow, Error> {
+    let mut fields = line.split(',');
+    let mut next = |name: &str| {
+        fields
+            .next()
+            .ok_or_else(|| bad_meta_kv(&format!("missing {name} in '{line}'")))
+    };
+    let ts_str = next("op_time")?;
+    let key = next("key")?;
+    let ks_str = next("key_size")?;
+    let op_str = next("op")?;
+    let count_str = next("op_count")?;
+    let size_str = next("size")?;
+    let _hits = next("cache_hits")?;
+    let ttl_str = next("ttl")?;
+
+    fn num<T: std::str::FromStr>(name: &str, s: &str) -> Result<T, Error>
+    where
+        T::Err: std::fmt::Display,
+    {
+        s.parse()
+            .map_err(|e| bad_meta_kv(&format!("bad {name} '{s}': {e}")))
+    }
+
+    let obj_id = match u64::from_str_radix(key, 16) {
+        Ok(id) if key.len() == 16 => id,
+        _ => {
+            let mut hasher = hash_state.build_hasher();
+            hasher.write(key.as_bytes());
+            hasher.finish()
+        }
+    };
+    let op = match op_str {
+        "GET" | "GET_LEASE" => Op::Get,
+        "SET" | "SET_LEASE" => Op::Set,
+        "DELETE" => Op::Delete,
+        _ => Op::Invalid,
+    };
+    let ttl: i32 = num("ttl", ttl_str)?;
+
+    Ok(MetaKvRow {
+        timestamp_secs: num("op_time", ts_str)?,
+        obj_id,
+        key_size: num("key_size", ks_str)?,
+        op,
+        op_count: num("op_count", count_str)?,
+        value_size: num("size", size_str)?,
+        ttl: if ttl > 0 { Some(ttl) } else { None },
+    })
+}
+
+fn bad_meta_kv(msg: &str) -> Error {
+    Error::InvalidFormat(format!("Meta key-value CSV: {msg}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +542,101 @@ mod tests {
         assert_eq!(entries[1].op, Some(Op::Set as u8));
         assert_eq!(entries[1].ttl, Some(7200));
         assert_eq!(entries[2].op, Some(Op::Delete as u8));
+    }
+
+    #[test]
+    fn parse_meta_kv_line_fields() {
+        let state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+        let row = parse_meta_kv_line(
+            "604038471,82131353f9ddc8c6,48,GET_LEASE,3,87,1,600,366387042,3003229276",
+            &state,
+        )
+        .unwrap();
+        assert_eq!(row.timestamp_secs, 604_038_471);
+        assert_eq!(row.obj_id, 0x8213_1353_f9dd_c8c6);
+        assert_eq!(row.key_size, 48);
+        assert_eq!(row.op, Op::Get);
+        assert_eq!(row.op_count, 3);
+        assert_eq!(row.value_size, 87);
+        assert_eq!(row.ttl, Some(600));
+    }
+
+    #[test]
+    fn meta_kv_rejects_another_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("trace.csv");
+        std::fs::write(&csv_path, "key,op,size,op_count,key_size\nabc,GET,0,1,3\n").unwrap();
+        let err =
+            convert_meta_kv_to_parquet(&csv_path, dir.path().join("t.parquet"), 1024).unwrap_err();
+        assert!(err.to_string().contains("202401"), "{err}");
+    }
+
+    #[test]
+    fn meta_kv_to_parquet_expands_counts_and_fills_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("trace.csv");
+        let pq_path = dir.path().join("trace.parquet");
+
+        // Key a: a miss before any size, then a SET of 100, a miss, a SET
+        // of 200 and a miss. Key b never has a size. Key c is not hex.
+        let csv_data = "\
+op_time,key,key_size,op,op_count,size,cache_hits,ttl,usecase,sub_usecase
+10,000000000000000a,8,GET_LEASE,2,0,0,0,1,1
+11,000000000000000a,8,SET_LEASE,1,100,0,3600,1,1
+12,000000000000000a,8,GET,1,0,0,0,1,1
+13,000000000000000a,8,SET,1,200,0,0,1,1
+13,000000000000000b,8,DELETE,1,0,0,0,1,1
+14,000000000000000a,8,GET,3,0,0,0,1,1
+14,c,1,GET,1,5,1,0,1,1
+";
+        std::fs::write(&csv_path, csv_data).unwrap();
+
+        let count = convert_meta_kv_to_parquet(&csv_path, &pq_path, 1024).unwrap();
+        assert_eq!(count, 10);
+
+        let entries: Vec<TraceEntry> = TraceReader::open(&pq_path)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // (seconds, obj_id, obj_size, op, ttl)
+        type Row = (i64, u64, u32, Option<u8>, Option<i32>);
+        let got: Vec<Row> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.timestamp / NANOS_PER_SEC,
+                    e.obj_id,
+                    e.obj_size,
+                    e.op,
+                    e.ttl,
+                )
+            })
+            .collect();
+        let (get, set, del) = (
+            Some(Op::Get as u8),
+            Some(Op::Set as u8),
+            Some(Op::Delete as u8),
+        );
+        let c = {
+            let mut h = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+            h.write(b"c");
+            h.finish()
+        };
+        assert_eq!(
+            got,
+            vec![
+                (10, 0xa, 108, get, None),
+                (10, 0xa, 108, get, None),
+                (11, 0xa, 108, set, Some(3600)),
+                (12, 0xa, 108, get, None),
+                (13, 0xa, 208, set, None),
+                (13, 0xb, 8, del, None),
+                (14, 0xa, 208, get, None),
+                (14, 0xa, 208, get, None),
+                (14, 0xa, 208, get, None),
+                (14, c, 6, get, None),
+            ]
+        );
+        assert!(entries.iter().all(|e| e.next_access_vtime == -1));
     }
 }
