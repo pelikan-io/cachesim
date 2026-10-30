@@ -123,14 +123,7 @@ pub fn convert_cache_trace_to_parquet(
     output: impl AsRef<Path>,
     batch_size: usize,
 ) -> Result<usize, Error> {
-    let path = input.as_ref();
-    let file = File::open(path)?;
-
-    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "zst" || e == "zstd") {
-        Box::new(BufReader::new(zstd::stream::read::Decoder::new(file)?))
-    } else {
-        Box::new(BufReader::new(file))
-    };
+    let reader = open_text(input.as_ref())?;
 
     let hash_state = ahash::RandomState::with_seeds(0, 0, 0, 0);
     let mut writer = TraceWriter::create(output, batch_size)?;
@@ -200,8 +193,12 @@ fn parse_cache_trace_line(
         _ => Op::Invalid,
     };
 
+    let timestamp = timestamp_secs
+        .checked_mul(NANOS_PER_SEC)
+        .ok_or_else(|| bad_csv(&format!("timestamp '{ts_str}' is out of range")))?;
+
     Ok(TraceEntry {
-        timestamp: timestamp_secs * NANOS_PER_SEC,
+        timestamp,
         obj_id,
         obj_size: key_size.saturating_add(value_size),
         next_access_vtime: -1,
@@ -230,21 +227,23 @@ const META_KV_HEADER: &str =
 ///
 /// * A row stands for `op_count` requests to one key in one second; it is
 ///   written as `op_count` entries with the same timestamp.
-/// * `op_time` (seconds) is widened to nanoseconds.
+/// * `op_time` (seconds) is widened to nanoseconds; a negative value or one
+///   past i64 nanoseconds is an error.
 /// * `key` is a 16-digit hex hash and is used as `obj_id`; a key that is
 ///   not hex is hashed via ahash (fixed seed).
 /// * `GET` and `GET_LEASE` become [`Op::Get`], `SET` and `SET_LEASE`
 ///   [`Op::Set`], `DELETE` [`Op::Delete`]; anything else [`Op::Invalid`].
-/// * `obj_size` = `key_size + size`. A miss records `size` 0; such a row
-///   takes the key's size from its most recent row with a size, or, if it
-///   has none yet, from the first one after it. A key that never has a size
-///   keeps 0.
+/// * `obj_size` = `key_size + size`. A GET miss and every DELETE record
+///   `size` 0; such a row takes the key's size from its most recent row
+///   with a size, or, if it has none yet, from the first one after it. A
+///   key that never has a size keeps 0.
 /// * `ttl` 0 becomes null. `cache_hits`, `usecase` and `sub_usecase` are
 ///   dropped; `next_access_vtime` is `-1`.
 /// * Files with a `.zst` extension are decompressed automatically.
 ///
 /// The input is read twice: once for each key's first size, once to write.
-/// The size map holds one entry per key that has a size.
+/// It must therefore be a regular file, not a pipe. The size map holds one
+/// entry per key that has a size.
 ///
 /// Returns the number of entries written.
 pub fn convert_meta_kv_to_parquet(
@@ -253,6 +252,11 @@ pub fn convert_meta_kv_to_parquet(
     batch_size: usize,
 ) -> Result<usize, Error> {
     let path = input.as_ref();
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(bad_meta_kv(
+            "input must be a regular file (it is read twice)",
+        ));
+    }
     let hash_state = ahash::RandomState::with_seeds(0, 0, 0, 0);
 
     let mut sizes: HashMap<u64, u32, ahash::RandomState> =
@@ -274,7 +278,7 @@ pub fn convert_meta_kv_to_parquet(
             sizes.get(&row.obj_id).copied().unwrap_or(0)
         };
         let entry = TraceEntry {
-            timestamp: row.timestamp_secs * NANOS_PER_SEC,
+            timestamp: row.timestamp_ns,
             obj_id: row.obj_id,
             obj_size: row.key_size.saturating_add(value_size),
             next_access_vtime: -1,
@@ -295,7 +299,7 @@ pub fn convert_meta_kv_to_parquet(
 /// One row of a Meta key-value cache trace.
 #[derive(Debug)]
 struct MetaKvRow {
-    timestamp_secs: i64,
+    timestamp_ns: i64,
     obj_id: u64,
     key_size: u32,
     op: Op,
@@ -381,9 +385,14 @@ fn parse_meta_kv_line(line: &str, hash_state: &ahash::RandomState) -> Result<Met
         _ => Op::Invalid,
     };
     let ttl: i32 = num("ttl", ttl_str)?;
+    let secs: i64 = num("op_time", ts_str)?;
+    let timestamp_ns = (secs >= 0)
+        .then(|| secs.checked_mul(NANOS_PER_SEC))
+        .flatten()
+        .ok_or_else(|| bad_meta_kv(&format!("op_time '{ts_str}' is negative or too large")))?;
 
     Ok(MetaKvRow {
-        timestamp_secs: num("op_time", ts_str)?,
+        timestamp_ns,
         obj_id,
         key_size: num("key_size", ks_str)?,
         op,
@@ -503,6 +512,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_cache_trace_rejects_a_timestamp_past_i64_nanoseconds() {
+        let state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+        for t in ["99999999999", "-99999999999"] {
+            let err = parse_cache_trace_line(&format!("{t},k,1,1,c,get,0"), &state).unwrap_err();
+            assert!(err.to_string().contains("out of range"), "{t}: {err}");
+        }
+    }
+
+    #[test]
     fn parse_cache_trace_deterministic_hash() {
         let state = ahash::RandomState::with_seeds(0, 0, 0, 0);
         let line1 = "0,mykey,4,100,1,get,0";
@@ -552,13 +570,32 @@ mod tests {
             &state,
         )
         .unwrap();
-        assert_eq!(row.timestamp_secs, 604_038_471);
+        assert_eq!(row.timestamp_ns, 604_038_471 * NANOS_PER_SEC);
         assert_eq!(row.obj_id, 0x8213_1353_f9dd_c8c6);
         assert_eq!(row.key_size, 48);
         assert_eq!(row.op, Op::Get);
         assert_eq!(row.op_count, 3);
         assert_eq!(row.value_size, 87);
         assert_eq!(row.ttl, Some(600));
+    }
+
+    #[test]
+    fn meta_kv_rejects_out_of_range_times() {
+        let state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+        for t in ["-1", "99999999999"] {
+            let line = format!("{t},000000000000000a,8,GET,1,0,0,0,1,1");
+            let err = parse_meta_kv_line(&line, &state).unwrap_err();
+            assert!(err.to_string().contains("op_time"), "{t}: {err}");
+        }
+    }
+
+    #[test]
+    fn meta_kv_rejects_an_input_that_is_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t.parquet");
+        let err = convert_meta_kv_to_parquet(dir.path(), &out, 1024).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err}");
+        assert!(!out.exists(), "no output is made");
     }
 
     #[test]

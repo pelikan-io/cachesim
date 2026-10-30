@@ -144,27 +144,30 @@ written as `op_count` rows with the same timestamp.
 
 | CSV field     | Parquet column       | Transformation                                   |
 |---------------|----------------------|--------------------------------------------------|
-| `op_time`     | `timestamp`          | seconds -> nanoseconds (`* 1_000_000_000`)       |
+| `op_time`     | `timestamp`          | seconds -> nanoseconds (`* 1_000_000_000`); negative or past i64 ns is an error |
 | `key`         | `obj_id`             | the 16-digit hex value; other keys hashed (ahash, fixed seed) |
 | `key_size`    | `obj_size` (partial) | `key_size + size`                                |
 | `op`          | `op`                 | `GET`, `GET_LEASE` -> GET; `SET`, `SET_LEASE` -> SET; `DELETE` -> DELETE |
 | `op_count`    | —                    | number of rows written                           |
-| `size`        | `obj_size` (partial) | 0 (a miss) -> the key's size, see below          |
+| `size`        | `obj_size` (partial) | 0 (a GET miss or a DELETE) -> the key's size, see below |
 | `cache_hits`  | —                    | not stored                                       |
 | `ttl`         | `ttl`                | 0 -> null, >0 -> Some                            |
 | `usecase`, `sub_usecase` | —         | not stored                                       |
 | —             | `next_access_vtime`  | set to `-1`                                      |
 
-A miss records `size` 0. Such a row takes the key's value size from its
-most recent row with a size, or, when there is none yet, from the first
-row after it with one; a key that never has a size keeps 0, so its
-`obj_size` is `key_size`. The importer reads the input twice to do this
-and holds one map entry per key with a size.
+A GET miss and every DELETE record `size` 0. Such a row takes the key's
+value size from its most recent row with a size, or, when there is none
+yet, from the first row after it with one; a key that never has a size
+keeps 0, so its `obj_size` is `key_size`. The importer reads the input
+twice to do this, so the input must be a regular file, not a pipe. It
+holds one map entry per key with a size.
 
 Day 1 of the release (`kvcache_traces_1.csv.zst`) has 154,604,153 rows
 standing for 281,577,413 requests to 19,087,078 keys over 86,520 s, and
-35,079,591 size-0 GET and GET_LEASE rows. Its conversion took 191 s and
-peaked at 1.04 GB resident on an Apple M4 Max.
+35,079,591 size-0 GET and GET_LEASE rows. 2,335,801 keys (12.2%) never
+have a size; they take 10,465,374 requests (3.7%), 8,674,087 of them GET
+misses. Its conversion took 191 s and peaked at 1.04 GB resident on an
+Apple M4 Max.
 
 ### Mooncake traces and KV-cache request traces
 
